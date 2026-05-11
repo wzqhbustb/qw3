@@ -1,0 +1,47 @@
+# External reference code (cloned separately)
+ds4/
+.llama-cpp/
+
+# Build artifacts
+*.o
+*.a
+*.dylib
+*.dSYM/
+*.metallib
+build/
+
+# Compiled binaries
+add_vectors
+matmul_tiled
+qwen3-cli
+dump_logits_llama
+test_reference
+test_metal
+test_attention_metal
+test_matmul_quant_metal
+test_moe_metal
+test_gguf
+test_tokenizer
+test_layer0_e2e
+
+# Python virtual environments
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Model files (too large for git)
+*.gguf
+
+# Temporary artifacts
+*.pt
+*.bin
+layer0_c_*.bin

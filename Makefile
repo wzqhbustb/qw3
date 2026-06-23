@@ -81,9 +81,17 @@ qwen3-cli: tools/qwen3-cli.c src/ds3_metal.m $(DS3_SRCS) $(DS3_ENGINE_SRCS)
 run-cli: qwen3-cli
 	@echo "Usage: ./qwen3-cli -m <model.gguf> -p '<prompt>'"
 
+# ── Qwen3 engine socket daemon ───────────────────────────
+
+qwen3-engine-daemon: tools/qwen3-engine-daemon.c src/ds3_metal.m $(DS3_SRCS) $(DS3_ENGINE_SRCS)
+	$(CC) $(CFLAGS) -I. -o $@ tools/qwen3-engine-daemon.c src/ds3_metal.m $(DS3_SRCS) $(DS3_ENGINE_SRCS) $(LDLIBS) -lm
+
+run-daemon: qwen3-engine-daemon
+	@echo "Usage: ./qwen3-engine-daemon -m <model.gguf> -s /tmp/qwen3-engine.sock"
+
 # ── Clean ────────────────────────────────────────────────
 
 clean:
-	rm -f add_vectors matmul_tiled qwen3-cli test_gguf test_tokenizer test_reference test_layer0_e2e test_metal test_matmul_quant_metal test_attention_metal test_moe_metal
+	rm -f add_vectors matmul_tiled qwen3-cli qwen3-engine-daemon test_gguf test_tokenizer test_reference test_layer0_e2e test_metal test_matmul_quant_metal test_attention_metal test_moe_metal
 	rm -f $(DS3_OBJS)
 	rm -f layer0_c_*.bin

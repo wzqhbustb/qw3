@@ -188,7 +188,7 @@ Socket Daemon 要解决的核心问题：
   "method": "create_session",
   "params": {
     "session_id": "sess-uuid-1234",
-    "system_prompt": "You are qw3-agent. /no_think\n\nAvailable tools: ...",
+    "system_prompt": "You are qw3-agent, a local AI coding assistant powered by Qwen3.\n\nAvailable tools: ...",
     "temperature": 0.7,
     "max_tokens": 2048
   }
@@ -209,7 +209,29 @@ Socket Daemon 要解决的核心问题：
 
 ### 4.3 `generate`
 
-核心接口。Agent 发送**当前轮用户输入**；daemon 自己维护该 session 的完整对话历史与 KV Cache，编码 system + 历史 + 当前 user 后生成。
+核心接口。Agent 发送**当前轮用户输入**；daemon 自己维护该 session 的完整对话历史与 KV Cache，按与 Agent 完全一致的 chat template 编码 system + 多轮历史 + 当前 user 后生成。
+
+daemon 内部不再调用 `ds3_engine_chat_format` 把整段对话包成单条 user 消息，而是直接构造标准 Qwen3 多轮 prompt：
+
+```
+<|im_start|>system
+{system_prompt}[\n\n{context}]<|im_end|>
+<|im_start|>user
+{user1}<|im_end|>
+<|im_start|>assistant
+{assistant1}[\n<tool_call>...]</tool_call>]<|im_end|>
+<|im_start|>tool\n[{id}] {name}: {result}<|im_end|>
+...
+<|im_start|>user
+{current_user}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+```
+
+然后 `ds3_engine_tokenize()` → `ds3_engine_generate_ex()`。多轮历史部分与 `agent.go:writeMessage()` 逐字节一致；最后的空 `<think>` 块用于引导模型输出最终答案。
 
 - `user_prompt` 可为空字符串，表示“工具结果已追加，请继续生成”。
 - `stream` 默认 `false`。
@@ -254,6 +276,10 @@ Socket Daemon 要解决的核心问题：
 ```
 
 > `current_tokens` / `max_tokens` 供 Agent 做 compact 决策，取代 Agent 本地的字符数估算。`current_tokens` **包含本轮 `context` 注入的 token 数**。
+
+> **Thinking 块处理**：daemon 在 generation prompt 末尾追加官方 Qwen3 `enable_thinking=false` 空 `<think>` 块（`<|im_start|>assistant\n<think>\n\n</think>\n\n`），引导模型把推理放进 `<think>...</think>` 并在同一次生成中输出最终答案。`ds3_engine` 不再把 `</think>` 当作硬停止符，因此答案不会被截断；daemon 返回前会剥离 `<think>...</think>` 块，只把最终答案写入 `text` 和 conversation 历史。
+>
+> **Phase 1 KV Cache 限制**：`ds3_engine_generate_ex()` 每次调用都会重置 `seq_len` 并重新 prefill 完整 prompt，因此 daemon 当前主要省去的是每轮重新加载模型的时间，**并未实现跨轮 KV Cache 复用**。真正的前缀缓存需要 Phase 3 的 KV Cache Service。
 
 > **TODO（Phase 1 可选）**：当前 Agent 从 `text` 中正则提取 `<tool_call>`。未来可在 `result` 中直接返回结构化 `tool_calls` 数组，减少文本解析。
 
@@ -419,12 +445,14 @@ typedef struct {
 
 daemon 内部流程：
 
-1. `create_session` 时编码 `system_prompt` 并缓存。
-2. `generate(user_prompt)`：把 system + 已缓存历史 + 当前 user 编码；只追加新增 tokens 到 engine KV Cache。
-3. `append_turn(role, content)`：按角色编码并追加到 KV Cache，不生成。
+1. `create_session` 时缓存 `system_prompt`、temperature、max_tokens。
+2. `generate(user_prompt)`：按 `agent.go:writeMessage()` 格式构造完整多轮 prompt，并在 assistant prefix 后追加空 `<think>` 块，然后 `ds3_engine_tokenize()` → `ds3_engine_generate_ex()`。
+3. `append_turn(role, content)`：仅把消息追加到 daemon 内存历史，不触发生成。
 4. `generate("")`：在已追加 tool result 的基础上继续生成。
-5. assistant 输出 tokens 解码为 text 后，作为 assistant turn 追加到 conversation。
-6. **`generate("")` 的边界**：daemon 在已有 tool_result 后生成时，遇到 EOS、stop token 或下一个 `<tool_call>` 起始标记即停止；输出文本作为 assistant turn 追加后，下一轮 `generate("")` 不会重复编码它，因为该 assistant turn 已经是 conversation 历史的一部分。
+5. assistant 输出 tokens 解码为 text 并剥离 `<think>` 块后，作为 assistant turn 追加到 conversation。
+6. **`generate("")` 的边界**：daemon 在已有 tool_result 后生成时，遇到 EOS 或下一个 `<tool_call>` 起始标记即停止；`<think>`/`</think>`  reasoning 块不会被当作终止符；输出文本作为 assistant turn 追加后，下一轮 `generate("")` 不会重复编码它，因为该 assistant turn 已经是 conversation 历史的一部分。
+
+> **Phase 1 实现说明**：由于 `ds3_engine_generate_ex()` 每次都会重置 KV state，第 2 步实际上每次都会重新编码完整 prompt。Session 隔离和模型常驻已生效，但**增量 KV Cache 追加与前缀缓存尚未实现**。
 
 ### 5.3 Context Window 管理
 
@@ -767,7 +795,7 @@ if !daemonRunning(socketPath) {
 ## 12. 风险与注意事项
 
 1. **Agent-Daemon 历史同步**：最大风险。必须严格遵循增量契约（`generate` + `append_turn` + `replace_history`），任何一方漏步都会导致 KV Cache 与 Agent 历史 diverge。
-   - **chat template 格式化一致性**：daemon 的 C 实现必须把 `replace_history` 中的结构化消息编码成与 Agent 现有 `writeMessage()` **逐字节一致**的 token 序列。任何空格、换行、`<|im_end|>` 位置差异都会导致 KV Cache token 不匹配。
+   - **chat template 格式化一致性（Phase 1 已修复）**：daemon 直接构造与 `agent.go:writeMessage()` 逐字节一致的多轮 prompt，再调用 `ds3_engine_tokenize()`，因此 `replace_history` 重放的历史与 `generate` 自身编码的历史完全等价。
 2. **Compact 后 KV 失效**：`replace_history` 默认重建 KV Cache，会暂时失去前缀缓存优势。`preserve_kv_cache: true` 模式需谨慎验证。
 3. **Metal 资源竞争**：多个 session 同时生成会共享 GPU，Phase 1 串行可避免；Phase 2 需 benchmark 确定 worker 数。
 4. **内存占用**：每个 session 都保留完整 KV cache，长上下文多 session 可能 OOM。需要 `max-sessions` / LRU 上限。

@@ -3016,7 +3016,10 @@ static bool is_stop_token(const ds3_engine_t *e, int token_id)
     if (token_id < 0) return false;
     if (token_id == e->vocab.eos_id) return true;
     if (token_id == e->vocab.im_end_id) return true;
-    if (token_id == e->vocab.think_end_id) return true;
+    /* Temporarily disabled: stopping on </think> truncates the final answer
+     * for the Qwen3 GGUF we are testing.  Let the token be emitted and strip
+     * the think block in the caller. */
+    /* if (token_id == e->vocab.think_end_id) return true; */
     return false;
 }
 

@@ -23,6 +23,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #define DS3_KVC_LOCAL_SESSIONS 16
 #define DS3_KVC_LOCAL_TOKENS   8192
@@ -436,21 +437,47 @@ typedef struct {
     /* Heartbeat lease tracking. */
     char daemon_id[32];
     time_t last_heartbeat;
+
+    /* Background heartbeat thread.
+     * - heartbeat_thread: detached at creation, joined in service_close.
+     * - shutdown: set to 1 by service_close to wake the thread immediately.
+     * - wake_cond / wake_mutex: signalled every HEARTBEAT_INTERVAL_SECS, or
+     *   on shutdown, so the thread does not have to poll sleep(10) and can
+     *   exit promptly. */
+    pthread_t heartbeat_thread;
+    int shutdown;
+    pthread_mutex_t wake_mutex;
+    pthread_cond_t wake_cond;
 } ds3_kv_service_state_t;
 
+#define HEARTBEAT_INTERVAL_SECS 10
+
 static int service_heartbeat(ds3_kv_service_state_t *svc);
+
+/* Forward declaration: service_call_inner is used by service_call (above) and
+ * service_heartbeat (below).  The full definition appears later in the file. */
+static int service_call_inner(ds3_kv_service_state_t *svc,
+                              const char *method,
+                              const pb_msgdesc_t *req_fields, const void *req_msg,
+                              const pb_msgdesc_t *resp_fields, void *resp_msg);
+
+/* Called by the main thread and the heartbeat thread.  Serialises all
+ * RPC activity so that two concurrent threads (e.g. an in-flight generate
+ * RPC and a periodic heartbeat) do not interleave on the same socket. */
+static int service_call(ds3_kv_service_state_t *svc,
+                        const char *method,
+                        const pb_msgdesc_t *req_fields, const void *req_msg,
+                        const pb_msgdesc_t *resp_fields, void *resp_msg)
+{
+    pthread_mutex_lock(&svc->wake_mutex);
+    int rc = service_call_inner(svc, method, req_fields, req_msg, resp_fields, resp_msg);
+    pthread_mutex_unlock(&svc->wake_mutex);
+    return rc;
+}
 
 static int service_connect(ds3_kv_service_state_t *svc)
 {
     if (svc->connected) {
-        /* Send heartbeat every 10 seconds to maintain the session lease. */
-        time_t now = time(NULL);
-        if (now - svc->last_heartbeat >= 10) {
-            /* Update the timestamp before the nested service_call to avoid
-             * re-entrant heartbeat recursion. */
-            svc->last_heartbeat = now;
-            service_heartbeat(svc);
-        }
         return 0;
     }
 
@@ -649,10 +676,11 @@ typedef struct {
     pb_byte_t bytes[];
 } pb_bytes_dyn_t;
 
-static int service_call(ds3_kv_service_state_t *svc,
-                        const char *method,
-                        const pb_msgdesc_t *req_fields, const void *req_msg,
-                        const pb_msgdesc_t *resp_fields, void *resp_msg)
+/* Caller must hold svc->wake_mutex. */
+static int service_call_inner(ds3_kv_service_state_t *svc,
+                              const char *method,
+                              const pb_msgdesc_t *req_fields, const void *req_msg,
+                              const pb_msgdesc_t *resp_fields, void *resp_msg)
 {
     if (service_connect(svc) != 0) return -1;
 
@@ -729,7 +757,8 @@ static int service_call(ds3_kv_service_state_t *svc,
 }
 
 /* Send a Heartbeat RPC to the service, listing all active sessions.
- * Called from service_connect when the heartbeat interval has elapsed. */
+ * Caller must hold svc->wake_mutex for the entire call so the session
+ * scan and RPC are atomic with respect to concurrent close_session / reset_session. */
 static int service_heartbeat(ds3_kv_service_state_t *svc)
 {
     char session_ids[DS3_KVC_SERVICE_SESSIONS][64];
@@ -751,13 +780,55 @@ static int service_heartbeat(ds3_kv_service_state_t *svc)
     req.session_ids.arg = &ctx;
 
     ds3_kvcache_StatusResp resp = ds3_kvcache_StatusResp_init_zero;
-    int rc = service_call(svc, "Heartbeat",
-                          ds3_kvcache_HeartbeatReq_fields, &req,
-                          ds3_kvcache_StatusResp_fields, &resp);
+    int rc = service_call_inner(svc, "Heartbeat",
+                                ds3_kvcache_HeartbeatReq_fields, &req,
+                                ds3_kvcache_StatusResp_fields, &resp);
     if (rc == 0 && resp.ok) {
         svc->last_heartbeat = time(NULL);
     }
     return rc;
+}
+
+/* Wait up to `secs` for a wake event or shutdown.  Returns 1 if shutdown
+ * was signalled, 0 if timeout elapsed. */
+static int wait_or_shutdown(ds3_kv_service_state_t *svc, int secs)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += secs;
+    pthread_mutex_lock(&svc->wake_mutex);
+    while (!svc->shutdown) {
+        int rc = pthread_cond_timedwait(&svc->wake_cond, &svc->wake_mutex, &ts);
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&svc->wake_mutex);
+            return 0;
+        }
+        if (rc != 0 && rc != EINTR) {
+            pthread_mutex_unlock(&svc->wake_mutex);
+            return 0;
+        }
+        if (svc->shutdown) {
+            pthread_mutex_unlock(&svc->wake_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&svc->wake_mutex);
+    return 1;
+}
+
+static void *service_heartbeat_thread(void *arg)
+{
+    ds3_kv_service_state_t *svc = (ds3_kv_service_state_t *)arg;
+    while (!svc->shutdown) {
+        if (wait_or_shutdown(svc, HEARTBEAT_INTERVAL_SECS)) {
+            break;  /* shutdown signalled */
+        }
+        /* Send heartbeat holding the mutex so session scan and RPC are atomic. */
+        pthread_mutex_lock(&svc->wake_mutex);
+        service_heartbeat(svc);
+        pthread_mutex_unlock(&svc->wake_mutex);
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------------
@@ -826,19 +897,41 @@ static int service_ensure_mmap(ds3_kv_service_state_t *svc)
     return 0;
 }
 
-static service_session_cache_t *service_find_session_cache(ds3_kv_service_state_t *svc, const char *session_id)
+/* Caller must hold svc->wake_mutex. */
+static service_session_cache_t *service_find_session_cache_unlocked(ds3_kv_service_state_t *svc, const char *session_id)
 {
     for (int i = 0; i < DS3_KVC_SERVICE_SESSIONS; i++) {
-        if (svc->sessions[i].valid && strcmp(svc->sessions[i].session_id, session_id) == 0)
+        if (svc->sessions[i].valid && strcmp(svc->sessions[i].session_id, session_id) == 0) {
             return &svc->sessions[i];
+        }
     }
+    return NULL;
+}
+
+/* Protects svc->sessions[] against concurrent access from the heartbeat
+ * thread and the main engine thread.  Uses wake_mutex because it is also
+ * used to serialise all RPC activity on the daemon-side socket. */
+static service_session_cache_t *service_find_session_cache(ds3_kv_service_state_t *svc, const char *session_id)
+{
+    pthread_mutex_lock(&svc->wake_mutex);
+    for (int i = 0; i < DS3_KVC_SERVICE_SESSIONS; i++) {
+        if (svc->sessions[i].valid && strcmp(svc->sessions[i].session_id, session_id) == 0) {
+            pthread_mutex_unlock(&svc->wake_mutex);
+            return &svc->sessions[i];
+        }
+    }
+    pthread_mutex_unlock(&svc->wake_mutex);
     return NULL;
 }
 
 static service_session_cache_t *service_alloc_session_cache(ds3_kv_service_state_t *svc, const char *session_id)
 {
-    service_session_cache_t *s = service_find_session_cache(svc, session_id);
-    if (s) return s;
+    pthread_mutex_lock(&svc->wake_mutex);
+    service_session_cache_t *s = service_find_session_cache_unlocked(svc, session_id);
+    if (s) {
+        pthread_mutex_unlock(&svc->wake_mutex);
+        return s;
+    }
     for (int i = 0; i < DS3_KVC_SERVICE_SESSIONS; i++) {
         if (!svc->sessions[i].valid) {
             svc->sessions[i].valid = 1;
@@ -846,9 +939,11 @@ static service_session_cache_t *service_alloc_session_cache(ds3_kv_service_state
             svc->sessions[i].session_id[sizeof(svc->sessions[i].session_id) - 1] = '\0';
             svc->sessions[i].cached_len = 0;
             svc->sessions[i].n_blocks = 0;
+            pthread_mutex_unlock(&svc->wake_mutex);
             return &svc->sessions[i];
         }
     }
+    pthread_mutex_unlock(&svc->wake_mutex);
     return NULL;
 }
 
@@ -884,11 +979,34 @@ static ds3_kv_cache_provider_t *service_open(const char *config)
     svc->fd = -1;
     svc->mmap_fd = -1;
     svc->last_heartbeat = 0;
+    svc->shutdown = 0;
     snprintf(svc->daemon_id, sizeof(svc->daemon_id), "%d", (int)getpid());
     if (config && config[0]) {
         strncpy(svc->socket_path, config, sizeof(svc->socket_path) - 1);
     } else {
         strncpy(svc->socket_path, DS3_KVC_SOCKET_PATH, sizeof(svc->socket_path) - 1);
+    }
+
+    /* Non-recursive mutex: wake_cond is signalled while holding it to wake
+     * the heartbeat thread immediately on shutdown. */
+    if (pthread_mutex_init(&svc->wake_mutex, NULL) != 0) {
+        free(svc);
+        free(p);
+        return NULL;
+    }
+    if (pthread_cond_init(&svc->wake_cond, NULL) != 0) {
+        pthread_mutex_destroy(&svc->wake_mutex);
+        free(svc);
+        free(p);
+        return NULL;
+    }
+
+    if (pthread_create(&svc->heartbeat_thread, NULL, service_heartbeat_thread, svc) != 0) {
+        pthread_cond_destroy(&svc->wake_cond);
+        pthread_mutex_destroy(&svc->wake_mutex);
+        free(svc);
+        free(p);
+        return NULL;
     }
 
     p->vtable = &ds3_kv_service_provider;
@@ -901,6 +1019,15 @@ static void service_close(ds3_kv_cache_provider_t *p)
     if (!p) return;
     ds3_kv_service_state_t *svc = (ds3_kv_service_state_t *)p->priv;
     if (svc) {
+        /* Signal shutdown and wake the heartbeat thread immediately so
+         * pthread_join does not have to wait for the next tick. */
+        pthread_mutex_lock(&svc->wake_mutex);
+        svc->shutdown = 1;
+        pthread_cond_broadcast(&svc->wake_cond);
+        pthread_mutex_unlock(&svc->wake_mutex);
+        pthread_join(svc->heartbeat_thread, NULL);
+        pthread_cond_destroy(&svc->wake_cond);
+        pthread_mutex_destroy(&svc->wake_mutex);
         service_disconnect(svc);
         if (svc->mmap_base) munmap(svc->mmap_base, svc->mmap_size);
         if (svc->mmap_fd >= 0) close(svc->mmap_fd);

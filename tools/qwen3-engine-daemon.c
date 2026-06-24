@@ -327,6 +327,10 @@ typedef struct session {
 
     int total_generated;
     time_t last_active;
+
+    /* Provider-side session has been created (so we don't recreate it every
+     * generate call). */
+    int provider_session_created;
 } session_t;
 
 typedef struct {
@@ -337,6 +341,7 @@ typedef struct {
 
 typedef struct {
     ds3_engine_t *engine;
+    ds3_kv_cache_provider_t *kv_provider;
     session_t **sessions;
     int n_sessions;
     int session_capacity;
@@ -549,6 +554,9 @@ static session_t *session_find(daemon_state_t *ds, const char *id) {
 static void session_close(daemon_state_t *ds, const char *id) {
     for (int i = 0; i < ds->n_sessions; i++) {
         if (strcmp(ds->sessions[i]->id, id) == 0) {
+            if (ds->kv_provider && ds->sessions[i]->provider_session_created) {
+                ds3_kv_cache_close_session(ds->kv_provider, id);
+            }
             session_free(ds->sessions[i]);
             ds->sessions[i] = ds->sessions[--ds->n_sessions];
             return;
@@ -779,6 +787,14 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
     }
 
     float temp = temperature >= 0 ? temperature : s->temperature;
+
+    /* Tell the engine which session owns the KV cache for this generate. */
+    ds3_engine_set_session_id(ds->engine, s->id);
+    if (ds->kv_provider && !s->provider_session_created) {
+        ds3_kv_cache_create_session(ds->kv_provider, s->id);
+        s->provider_session_created = 1;
+    }
+
     int n_gen = ds3_engine_generate_ex(ds->engine, prompt_tokens, n_prompt,
                                        max_gen, temp,
                                        output_tokens, max_gen, NULL, NULL);
@@ -948,7 +964,12 @@ static void handle_load_model(daemon_state_t *ds, const request_t *req, int fd) 
 
     if (ds->engine) {
         /* Close existing sessions; engine will be reopened. */
-        for (int i = 0; i < ds->n_sessions; i++) session_free(ds->sessions[i]);
+        for (int i = 0; i < ds->n_sessions; i++) {
+            if (ds->kv_provider && ds->sessions[i]->provider_session_created) {
+                ds3_kv_cache_close_session(ds->kv_provider, ds->sessions[i]->id);
+            }
+            session_free(ds->sessions[i]);
+        }
         ds->n_sessions = 0;
         ds3_engine_close(ds->engine);
         ds->engine = NULL;
@@ -959,6 +980,9 @@ static void handle_load_model(daemon_state_t *ds, const request_t *req, int fd) 
     if (!ds->engine) {
         send_error(fd, req->id, -32001, "failed to load model");
         return;
+    }
+    if (ds->kv_provider) {
+        ds3_engine_set_kv_provider(ds->engine, ds->kv_provider);
     }
     ds->n_ctx = n_ctx;
 
@@ -988,6 +1012,11 @@ static void handle_create_session(daemon_state_t *ds, const request_t *req, int 
         free(system_prompt);
         send_error(fd, req->id, -32005, "failed to create session");
         return;
+    }
+
+    if (ds->kv_provider) {
+        ds3_kv_cache_create_session(ds->kv_provider, id);
+        s->provider_session_created = 1;
     }
 
     buf_t b = {0};
@@ -1167,6 +1196,12 @@ static void handle_replace_history(daemon_state_t *ds, const request_t *req, int
     for (int i = 0; i < n_msgs; i++) msg_free(&msgs[i]);
     free(msgs);
 
+    /* Invalidate KV cache when history is replaced without preserving.
+     * The token sequence has changed so any cached prefix is invalid. */
+    if (!preserve && ds->kv_provider) {
+        ds3_kv_cache_reset_session(ds->kv_provider, session_id);
+    }
+
     free(session_id);
     send_response(fd, req->id, true, "{\"replaced\":true}", 0, NULL);
 }
@@ -1185,6 +1220,9 @@ static void handle_reset_session(daemon_state_t *ds, const request_t *req, int f
     }
     for (int i = 0; i < s->n_messages; i++) msg_free(&s->messages[i]);
     s->n_messages = 0;
+    if (ds->kv_provider && s->provider_session_created) {
+        ds3_kv_cache_reset_session(ds->kv_provider, session_id);
+    }
     free(session_id);
     send_response(fd, req->id, true, "{\"reset\":true}", 0, NULL);
 }
@@ -1313,6 +1351,8 @@ static void print_usage(const char *argv0) {
         "  -m PATH   Path to Qwen3 GGUF model\n"
         "  -s PATH   Unix Domain Socket path (default: /tmp/qwen3-engine.sock)\n"
         "  -c N      Context length / KV cache size (default: 4096)\n"
+        "  -k TYPE   KV-cache provider: local, service, fallback, none (default: none)\n"
+        "  -K PATH   KV-cache service socket path (default: /tmp/ds3-kv-cache.sock)\n"
         "  -q        Quiet mode\n",
         argv0);
 }
@@ -1324,6 +1364,8 @@ static void print_usage(const char *argv0) {
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *socket_path = "/tmp/qwen3-engine.sock";
+    const char *kv_provider_type = "none";
+    const char *kv_service_path = "/tmp/ds3-kv-cache.sock";
     int n_ctx = 4096;
     bool quiet = false;
 
@@ -1334,6 +1376,10 @@ int main(int argc, char **argv) {
             socket_path = argv[++i];
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             n_ctx = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+            kv_provider_type = argv[++i];
+        } else if (strcmp(argv[i], "-K") == 0 && i + 1 < argc) {
+            kv_service_path = argv[++i];
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
             quiet = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1357,10 +1403,26 @@ int main(int argc, char **argv) {
     ds.n_ctx = n_ctx;
     ds.started_at = time(NULL);
 
+    if (strcmp(kv_provider_type, "local") == 0) {
+        ds.kv_provider = ds3_kv_cache_provider_open(&ds3_kv_local_provider, NULL);
+    } else if (strcmp(kv_provider_type, "service") == 0) {
+        ds.kv_provider = ds3_kv_cache_provider_open(&ds3_kv_service_provider, kv_service_path);
+    } else if (strcmp(kv_provider_type, "fallback") == 0) {
+        ds.kv_provider = ds3_kv_cache_provider_open(&ds3_kv_fallback_provider, NULL);
+    } else if (strcmp(kv_provider_type, "none") != 0) {
+        fprintf(stderr, "Unknown KV provider type: %s\n", kv_provider_type);
+        print_usage(argv[0]);
+        return 1;
+    }
+
     ds.engine = ds3_engine_open(model_path, n_ctx);
     if (!ds.engine) {
         fprintf(stderr, "Failed to load engine from %s\n", model_path);
+        ds3_kv_cache_provider_close(ds.kv_provider);
         return 1;
+    }
+    if (ds.kv_provider) {
+        ds3_engine_set_kv_provider(ds.engine, ds.kv_provider);
     }
 
     int listen_fd = create_unix_socket(socket_path);
@@ -1402,8 +1464,14 @@ int main(int argc, char **argv) {
 
     close(listen_fd);
     unlink(socket_path);
-    for (int i = 0; i < ds.n_sessions; i++) session_free(ds.sessions[i]);
+    for (int i = 0; i < ds.n_sessions; i++) {
+        if (ds.kv_provider && ds.sessions[i]->provider_session_created) {
+            ds3_kv_cache_close_session(ds.kv_provider, ds.sessions[i]->id);
+        }
+        session_free(ds.sessions[i]);
+    }
     free(ds.sessions);
     ds3_engine_close(ds.engine);
+    ds3_kv_cache_provider_close(ds.kv_provider);
     return 0;
 }

@@ -12,6 +12,7 @@
 #include "ds3_tokenizer.h"
 #include "ds3_metal.h"
 #include "ds3_reference.h"
+#include "ds3_kv_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,6 +120,12 @@ struct ds3_engine {
 
     int n_ctx;
     int seq_len;
+
+    /* KV-cache provider for prefix caching.  NULL means no caching. */
+    ds3_kv_cache_provider_t *kv_provider;
+    char                     session_id[64];
+    void                    *kv_cache_host; /* [n_ctx][2][n_layer][n_kv_head][head_dim] FP16 */
+    size_t                   kv_cache_host_bytes;
 };
 
 /* ============================================================================
@@ -1513,6 +1520,8 @@ static int forward_token(ds3_engine_t *e, int token_id, float temperature)
  * Lifecycle
  * ============================================================================ */
 
+static void free_kv_cache_host(ds3_engine_t *e);
+
 static void free_layer_buffers(ds3_engine_t *e)
 {
     for (int l = 0; l < DS3_N_LAYER; l++) {
@@ -1570,6 +1579,7 @@ void ds3_engine_close(ds3_engine_t *e)
     ds3_metal_buffer_free(e->buf_layer_residuals);
 
     free(e->logits_host);
+    free_kv_cache_host(e);
 
     ds3_vocab_free(&e->vocab);
     ds3_weights_free(e->weights);
@@ -3011,6 +3021,84 @@ int ds3_engine_generate(ds3_engine_t *e,
                                   NULL, NULL);
 }
 
+/* ============================================================================
+ * KV-cache provider helpers
+ * ============================================================================ */
+
+static size_t kv_cache_layer_bytes(int n_tokens)
+{
+    return (size_t)n_tokens * DS3_N_HEAD_KV * DS3_HEAD_DIM * sizeof(uint16_t);
+}
+
+static int ensure_kv_cache_host(ds3_engine_t *e)
+{
+    if (e->kv_cache_host) return 0;
+    size_t bytes = (size_t)DS3_N_LAYER * 2 * kv_cache_layer_bytes(e->n_ctx);
+    e->kv_cache_host = calloc(1, bytes);
+    if (!e->kv_cache_host) {
+        fprintf(stderr, "[engine] failed to allocate host KV cache (%zu bytes)\n", bytes);
+        return -1;
+    }
+    e->kv_cache_host_bytes = bytes;
+    return 0;
+}
+
+static void free_kv_cache_host(ds3_engine_t *e)
+{
+    free(e->kv_cache_host);
+    e->kv_cache_host = NULL;
+    e->kv_cache_host_bytes = 0;
+}
+
+/* Download n_tokens of KV data from the GPU cache into a contiguous host
+ * buffer laid out as [L0 K][L0 V][L1 K][L1 V]... */
+static int kv_cache_download(ds3_engine_t *e, int n_tokens, void *host)
+{
+    if (!host || n_tokens <= 0 || n_tokens > e->n_ctx) return -1;
+    size_t layer_bytes = kv_cache_layer_bytes(n_tokens);
+    uint8_t *p = (uint8_t *)host;
+    for (int l = 0; l < DS3_N_LAYER; l++) {
+        if (ds3_metal_buffer_read(e->kv_k[l], 0, p, layer_bytes) != 0) return -1;
+        p += layer_bytes;
+        if (ds3_metal_buffer_read(e->kv_v[l], 0, p, layer_bytes) != 0) return -1;
+        p += layer_bytes;
+    }
+    return 0;
+}
+
+/* Upload n_tokens of KV data from a contiguous host buffer into the GPU
+ * cache at offset 0. */
+static int kv_cache_upload(ds3_engine_t *e, int n_tokens, const void *host)
+{
+    if (!host || n_tokens <= 0 || n_tokens > e->n_ctx) return -1;
+    size_t layer_bytes = kv_cache_layer_bytes(n_tokens);
+    const uint8_t *p = (const uint8_t *)host;
+    for (int l = 0; l < DS3_N_LAYER; l++) {
+        if (ds3_metal_buffer_write(e->kv_k[l], 0, p, layer_bytes) != 0) return -1;
+        p += layer_bytes;
+        if (ds3_metal_buffer_write(e->kv_v[l], 0, p, layer_bytes) != 0) return -1;
+        p += layer_bytes;
+    }
+    return 0;
+}
+
+void ds3_engine_set_kv_provider(ds3_engine_t *e, ds3_kv_cache_provider_t *provider)
+{
+    if (!e) return;
+    e->kv_provider = provider;
+}
+
+void ds3_engine_set_session_id(ds3_engine_t *e, const char *session_id)
+{
+    if (!e) return;
+    if (!session_id || !session_id[0]) {
+        e->session_id[0] = '\0';
+        return;
+    }
+    strncpy(e->session_id, session_id, sizeof(e->session_id) - 1);
+    e->session_id[sizeof(e->session_id) - 1] = '\0';
+}
+
 static bool is_stop_token(const ds3_engine_t *e, int token_id)
 {
     if (token_id < 0) return false;
@@ -3052,47 +3140,87 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
     ds3_metal_profile_reset();
     int next_token = -1;
 
-    /* Chunk prefill is now the default.  Users can opt out with
-     * DS3_NO_CHUNK_PREFILL=1 or (legacy) DS3_USE_CHUNK_PREFILL=0.  Very short
-     * prompts fall back to the token path because the batched dispatch overhead
-     * is not worth it for just a few tokens. */
-    bool use_chunk_prefill = true;
-    const char *no_chunk_env = getenv("DS3_NO_CHUNK_PREFILL");
-    const char *use_chunk_env = getenv("DS3_USE_CHUNK_PREFILL");
-    if (no_chunk_env != NULL) {
-        use_chunk_prefill = false;
-    } else if (use_chunk_env != NULL &&
-               (strcmp(use_chunk_env, "0") == 0 ||
-                strcmp(use_chunk_env, "false") == 0 ||
-                strcmp(use_chunk_env, "no") == 0)) {
-        use_chunk_prefill = false;
-    }
-    if (n_prompt < DS3_PREFILL_FALLBACK_TOKENS) {
-        use_chunk_prefill = false;
+    /* -------------------------------------------------------------------------
+     * KV-cache prefix lookup
+     * ------------------------------------------------------------------------- */
+    int cached_len = 0;
+    if (e->kv_provider && e->session_id[0] != '\0') {
+        if (e->kv_provider->vtable->lookup(e->kv_provider, e->session_id,
+                                           prompt_tokens, n_prompt,
+                                           &cached_len) == 0) {
+            if (cached_len < 0) cached_len = 0;
+            if (cached_len > n_prompt) cached_len = n_prompt;
+            if (cached_len > 0) {
+                if (ensure_kv_cache_host(e) == 0 &&
+                    e->kv_provider->vtable->read(e->kv_provider, e->session_id,
+                                                 0, cached_len, e->kv_cache_host) == 0 &&
+                    kv_cache_upload(e, cached_len, e->kv_cache_host) == 0) {
+                    e->seq_len = cached_len;
+                    ds3_log_info("[engine] KV cache hit: %d / %d tokens\n",
+                                 cached_len, n_prompt);
+                } else {
+                    cached_len = 0;
+                    e->seq_len = 0;
+                }
+            }
+        } else {
+            cached_len = 0;
+        }
     }
 
-    if (use_chunk_prefill) {
-        int chunk_size = DS3_PREFILL_CHUNK_SIZE;
-        const char *chunk_env = getenv("DS3_PREFILL_CHUNK_SIZE");
-        if (chunk_env) {
-            int v = atoi(chunk_env);
-            if (v > 0) chunk_size = v;
-        }
-
-        int prompt_pos = 0;
-        while (prompt_pos < n_prompt) {
-            int remaining = n_prompt - prompt_pos;
-            int chunk = remaining < chunk_size ? remaining : chunk_size;
-            next_token = forward_chunk(e, prompt_tokens + prompt_pos, chunk, temperature);
-            if (next_token < 0) return -1;
-            e->seq_len += chunk;
-            prompt_pos += chunk;
-        }
+    /* -------------------------------------------------------------------------
+     * Prefill remaining tokens
+     * ------------------------------------------------------------------------- */
+    if (cached_len == n_prompt && n_prompt > 0) {
+        /* Entire prompt is cached.  Run the last token once to obtain the
+         * first decode logit. */
+        e->seq_len = n_prompt - 1;
+        next_token = forward_token(e, prompt_tokens[n_prompt - 1], temperature);
+        if (next_token < 0) return -1;
+        e->seq_len++;
     } else {
-        for (int i = 0; i < n_prompt; i++) {
-            next_token = forward_token(e, prompt_tokens[i], 0.0f);
-            if (next_token < 0) return -1;
-            e->seq_len++;
+        /* Chunk prefill is now the default.  Users can opt out with
+         * DS3_NO_CHUNK_PREFILL=1 or (legacy) DS3_USE_CHUNK_PREFILL=0.  Very short
+         * prompts fall back to the token path because the batched dispatch overhead
+         * is not worth it for just a few tokens. */
+        bool use_chunk_prefill = true;
+        const char *no_chunk_env = getenv("DS3_NO_CHUNK_PREFILL");
+        const char *use_chunk_env = getenv("DS3_USE_CHUNK_PREFILL");
+        if (no_chunk_env != NULL) {
+            use_chunk_prefill = false;
+        } else if (use_chunk_env != NULL &&
+                   (strcmp(use_chunk_env, "0") == 0 ||
+                    strcmp(use_chunk_env, "false") == 0 ||
+                    strcmp(use_chunk_env, "no") == 0)) {
+            use_chunk_prefill = false;
+        }
+        if (n_prompt - cached_len < DS3_PREFILL_FALLBACK_TOKENS) {
+            use_chunk_prefill = false;
+        }
+
+        if (use_chunk_prefill) {
+            int chunk_size = DS3_PREFILL_CHUNK_SIZE;
+            const char *chunk_env = getenv("DS3_PREFILL_CHUNK_SIZE");
+            if (chunk_env) {
+                int v = atoi(chunk_env);
+                if (v > 0) chunk_size = v;
+            }
+
+            int prompt_pos = cached_len;
+            while (prompt_pos < n_prompt) {
+                int remaining = n_prompt - prompt_pos;
+                int chunk = remaining < chunk_size ? remaining : chunk_size;
+                next_token = forward_chunk(e, prompt_tokens + prompt_pos, chunk, temperature);
+                if (next_token < 0) return -1;
+                e->seq_len += chunk;
+                prompt_pos += chunk;
+            }
+        } else {
+            for (int i = cached_len; i < n_prompt; i++) {
+                next_token = forward_token(e, prompt_tokens[i], temperature);
+                if (next_token < 0) return -1;
+                e->seq_len++;
+            }
         }
     }
     ds3_metal_profile_print("prompt");
@@ -3112,6 +3240,31 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
         char label[32];
         snprintf(label, sizeof(label), "step=%d", i);
         ds3_metal_profile_print(label);
+    }
+
+    /* Write prompt + generated tokens KV back so future turns can reuse
+     * the full prefix including the assistant response. */
+    int total_len = n_prompt + n_gen;
+    if (e->kv_provider && e->session_id[0] != '\0' && total_len > 0) {
+        if (ensure_kv_cache_host(e) == 0 &&
+            kv_cache_download(e, total_len, e->kv_cache_host) == 0) {
+            size_t kv_bytes = (size_t)DS3_N_LAYER * 2 * kv_cache_layer_bytes(total_len);
+
+            /* Build merged token array: prompt + generated */
+            int *all_tokens = (int *)malloc((size_t)total_len * sizeof(int));
+            if (all_tokens) {
+                memcpy(all_tokens, prompt_tokens, (size_t)n_prompt * sizeof(int));
+                memcpy(all_tokens + n_prompt, output_tokens, (size_t)n_gen * sizeof(int));
+                int write_rc = e->kv_provider->vtable->write(e->kv_provider, e->session_id,
+                                                             all_tokens, total_len,
+                                                             e->kv_cache_host, kv_bytes);
+                free(all_tokens);
+                if (write_rc != 0) {
+                    ds3_log_warn("[engine] KV cache write failed for session %s (rc=%d)\n",
+                                 e->session_id, write_rc);
+                }
+            }
+        }
     }
 
     return n_gen;

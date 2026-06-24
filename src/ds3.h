@@ -21,6 +21,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include "ds3_kv_cache.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,6 +40,7 @@ static inline void ds3_set_quiet(int quiet) { ds3_log_quiet = quiet ? 1 : 0; }
 
 #define ds3_print_info(...) do { if (!ds3_log_quiet) printf(__VA_ARGS__); } while (0)
 #define ds3_log_info(...)   do { if (!ds3_log_quiet) fprintf(stderr, __VA_ARGS__); } while (0)
+#define ds3_log_warn(...)   do { if (!ds3_log_quiet) fprintf(stderr, __VA_ARGS__); } while (0)
 
 /* ============================================================================
  * 1. Model Architecture Constants
@@ -362,6 +365,15 @@ int ds3_engine_generate_ex(ds3_engine_t *engine,
                            int          output_capacity,
                            ds3_engine_logit_cb_t cb,
                            void *cb_user);
+
+/* Attach a KV-cache provider to the engine.  Passing NULL disables caching. */
+void ds3_engine_set_kv_provider(ds3_engine_t *engine,
+                                ds3_kv_cache_provider_t *provider);
+
+/* Set the session id used for provider lookups/writes.  Must be set before
+ * each generate call when a provider is attached. */
+void ds3_engine_set_session_id(ds3_engine_t *engine,
+                               const char *session_id);
 
 /* Tokenizer — implemented in ds3_tokenizer.c, see ds3_tokenizer.h for full API */
 struct ds3_vocab_t;

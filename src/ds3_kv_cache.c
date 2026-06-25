@@ -450,7 +450,7 @@ typedef struct {
     pthread_mutex_t wake_mutex;
     pthread_cond_t wake_cond;
 
-    /* Serialises the one-time mmap/SHM initialisation in service_ensure_mmap
+    /* Serialises the one-time SHM arena initialisation in service_ensure_shm_arena
      * without holding wake_mutex during the GetConfig RPC. */
     pthread_mutex_t mmap_mutex;
 } ds3_kv_service_state_t;
@@ -863,10 +863,10 @@ static void *service_heartbeat_thread(void *arg)
 }
 
 /* ------------------------------------------------------------------------
- * mmap management
+ * SHM arena management
  * ------------------------------------------------------------------------ */
 
-static int service_ensure_mmap(ds3_kv_service_state_t *svc)
+static int service_ensure_shm_arena(ds3_kv_service_state_t *svc)
 {
     /* Hold mmap_mutex while checking and initialising the backing region so
      * that two threads cannot both see mmap_base == NULL and both try to
@@ -1187,7 +1187,7 @@ static int service_lookup(ds3_kv_cache_provider_t *p,
 {
     ds3_kv_service_state_t *svc = (ds3_kv_service_state_t *)p->priv;
     *out_cached_len = 0;
-    if (service_ensure_mmap(svc) != 0) return 0;
+    if (service_ensure_shm_arena(svc) != 0) return 0;
 
     ds3_kvcache_LookupReq req = ds3_kvcache_LookupReq_init_zero;
     req.session_id.funcs.encode = &encode_string;
@@ -1325,7 +1325,7 @@ static int service_write(ds3_kv_cache_provider_t *p,
                          const void *kv_buffer, size_t kv_buffer_bytes)
 {
     ds3_kv_service_state_t *svc = (ds3_kv_service_state_t *)p->priv;
-    if (service_ensure_mmap(svc) != 0) return -1;
+    if (service_ensure_shm_arena(svc) != 0) return -1;
     if (!kv_buffer || kv_buffer_bytes == 0) return -1;
 
     service_session_cache_t *sc = service_find_session_cache(svc, session_id);

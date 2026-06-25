@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define DS3_KVC_LOCAL_SESSIONS 16
 #define DS3_KVC_LOCAL_TOKENS   8192
@@ -408,7 +409,7 @@ typedef struct {
 
 typedef struct {
     char session_id[64];
-    int valid;
+    atomic_int valid;   /* accessed by heartbeat thread and main engine thread */
     int cached_len;
     service_block_t blocks[DS3_KVC_SERVICE_MAX_BLOCKS];
     int n_blocks;
@@ -448,6 +449,10 @@ typedef struct {
     int shutdown;
     pthread_mutex_t wake_mutex;
     pthread_cond_t wake_cond;
+
+    /* Serialises the one-time mmap/SHM initialisation in service_ensure_mmap
+     * without holding wake_mutex during the GetConfig RPC. */
+    pthread_mutex_t mmap_mutex;
 } ds3_kv_service_state_t;
 
 #define HEARTBEAT_INTERVAL_SECS 10
@@ -655,19 +660,45 @@ static bool decode_string_to_buf(pb_istream_t *stream, const pb_field_t *field, 
     return true;
 }
 
+static bool decode_ignore_string(pb_istream_t *stream, const pb_field_t *field, void **arg)
+{
+    (void)field;
+    (void)arg;
+    uint8_t buf[256];
+    while (stream->bytes_left) {
+        size_t len = stream->bytes_left > sizeof(buf) ? sizeof(buf) : stream->bytes_left;
+        if (!pb_read(stream, buf, len)) return false;
+    }
+    return true;
+}
+
 static bool decode_repeated_block_handle(pb_istream_t *stream, const pb_field_t *field, void **arg)
 {
     (void)field;
     decode_blocks_ctx_t *ctx = (decode_blocks_ctx_t *)*arg;
     if (ctx->n_blocks >= ctx->max_blocks) return false;
     ds3_kvcache_BlockHandle bh = ds3_kvcache_BlockHandle_init_zero;
+    bh.shm_name.funcs.decode = &decode_ignore_string;
     if (!pb_decode(stream, ds3_kvcache_BlockHandle_fields, &bh)) return false;
     ctx->blocks[ctx->n_blocks].handle.block_id = bh.block_id;
-    ctx->blocks[ctx->n_blocks].handle.mmap_offset = bh.mmap_offset;
+    /* Prefer the backend-agnostic offset field; fall back to the legacy
+     * mmap_offset for older services. */
+    ctx->blocks[ctx->n_blocks].handle.mmap_offset = bh.offset ? bh.offset : bh.mmap_offset;
     ctx->blocks[ctx->n_blocks].start_token = 0;
     ctx->blocks[ctx->n_blocks].n_tokens = 0;
     ctx->n_blocks++;
     return true;
+}
+
+/* Decode and discard a BlockHandle.  Used for fields that the current
+ * implementation does not consume (e.g. cold_loaded_blocks). */
+static bool decode_ignore_block_handle(pb_istream_t *stream, const pb_field_t *field, void **arg)
+{
+    (void)field;
+    (void)arg;
+    ds3_kvcache_BlockHandle bh = ds3_kvcache_BlockHandle_init_zero;
+    bh.shm_name.funcs.decode = &decode_ignore_string;
+    return pb_decode(stream, ds3_kvcache_BlockHandle_fields, &bh);
 }
 
 /* Wrapper for RpcRequest envelope with dynamic payload sizing. */
@@ -764,7 +795,7 @@ static int service_heartbeat(ds3_kv_service_state_t *svc)
     char session_ids[DS3_KVC_SERVICE_SESSIONS][64];
     int n_sessions = 0;
     for (int i = 0; i < DS3_KVC_SERVICE_SESSIONS; i++) {
-        if (svc->sessions[i].valid && svc->sessions[i].session_id[0]) {
+        if (atomic_load(&svc->sessions[i].valid) && svc->sessions[i].session_id[0]) {
             strncpy(session_ids[n_sessions], svc->sessions[i].session_id, 63);
             session_ids[n_sessions][63] = '\0';
             n_sessions++;
@@ -837,30 +868,48 @@ static void *service_heartbeat_thread(void *arg)
 
 static int service_ensure_mmap(ds3_kv_service_state_t *svc)
 {
-    if (svc->mmap_base) return 0;
+    /* Hold mmap_mutex while checking and initialising the backing region so
+     * that two threads cannot both see mmap_base == NULL and both try to
+     * mmap/open the same resource.  mmap_mutex is separate from wake_mutex so
+     * the heartbeat thread is not blocked during the GetConfig RPC. */
+    pthread_mutex_lock(&svc->mmap_mutex);
+
+    if (svc->mmap_base) {
+        pthread_mutex_unlock(&svc->mmap_mutex);
+        return 0;
+    }
 
     ds3_kvcache_Empty req = ds3_kvcache_Empty_init_zero;
     ds3_kvcache_ConfigResp resp = ds3_kvcache_ConfigResp_init_zero;
     char mmap_path[256] = {0};
+    char shm_name[256] = {0};
+    char l2_root[256] = {0};
     char err_buf[256] = {0};
     decode_string_ctx_t path_ctx = { mmap_path, sizeof(mmap_path) };
+    decode_string_ctx_t shm_ctx = { shm_name, sizeof(shm_name) };
+    decode_string_ctx_t l2_ctx = { l2_root, sizeof(l2_root) };
     decode_string_ctx_t err_ctx = { err_buf, sizeof(err_buf) };
     resp.mmap_path.funcs.decode = &decode_string_to_buf;
     resp.mmap_path.arg = &path_ctx;
+    resp.shm_name.funcs.decode = &decode_string_to_buf;
+    resp.shm_name.arg = &shm_ctx;
+    resp.l2_root.funcs.decode = &decode_string_to_buf;
+    resp.l2_root.arg = &l2_ctx;
     resp.error.funcs.decode = &decode_string_to_buf;
     resp.error.arg = &err_ctx;
 
     if (service_call(svc, "GetConfig",
                      ds3_kvcache_Empty_fields, &req,
                      ds3_kvcache_ConfigResp_fields, &resp) != 0) {
+        pthread_mutex_unlock(&svc->mmap_mutex);
         return -1;
     }
     if (!resp.ok) {
         ds3_log_warn("kv-cache GetConfig failed: %s\n", err_buf[0] ? err_buf : "unknown");
+        pthread_mutex_unlock(&svc->mmap_mutex);
         return -1;
     }
 
-    strncpy(svc->mmap_path, mmap_path, sizeof(svc->mmap_path) - 1);
     svc->block_size = resp.block_size ? resp.block_size : 16;
     svc->per_token_kv_bytes = (int)resp.per_token_kv_bytes;
     if (svc->per_token_kv_bytes <= 0) svc->per_token_kv_bytes = 98304;
@@ -869,14 +918,38 @@ static int service_ensure_mmap(ds3_kv_service_state_t *svc)
     svc->mmap_size = (size_t)resp.mmap_size;
     if (svc->mmap_size == 0) svc->mmap_size = (size_t)svc->block_total_size * 1024 + DS3_KVC_REGION_HEADER_SIZE;
 
-    int fd = open(svc->mmap_path, O_RDWR);
-    if (fd < 0) return -1;
+    int fd = -1;
+    const char *target_name = NULL;
+    if (resp.storage_mode == ds3_kvcache_StorageMode_TIERED) {
+        if (shm_name[0] == '\0') {
+            ds3_log_warn("kv-cache tiered mode returned empty shm_name\n");
+            pthread_mutex_unlock(&svc->mmap_mutex);
+            return -1;
+        }
+        fd = shm_open(shm_name, O_RDWR, 0666);
+        target_name = shm_name;
+    } else {
+        if (mmap_path[0] == '\0') {
+            ds3_log_warn("kv-cache mmap mode returned empty mmap_path\n");
+            pthread_mutex_unlock(&svc->mmap_mutex);
+            return -1;
+        }
+        fd = open(mmap_path, O_RDWR);
+        target_name = mmap_path;
+    }
+    if (fd < 0) {
+        ds3_log_warn("kv-cache failed to open %s: %s\n", target_name, strerror(errno));
+        pthread_mutex_unlock(&svc->mmap_mutex);
+        return -1;
+    }
     svc->mmap_fd = fd;
+    strncpy(svc->mmap_path, target_name, sizeof(svc->mmap_path) - 1);
 
     uint8_t *base = (uint8_t *)mmap(NULL, svc->mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) {
         close(fd);
         svc->mmap_fd = -1;
+        pthread_mutex_unlock(&svc->mmap_mutex);
         return -1;
     }
     svc->mmap_base = base;
@@ -888,12 +961,14 @@ static int service_ensure_mmap(ds3_kv_service_state_t *svc)
         close(fd);
         svc->mmap_base = NULL;
         svc->mmap_fd = -1;
+        pthread_mutex_unlock(&svc->mmap_mutex);
         return -1;
     }
 
     svc->block_size = svc->region_header->block_size ? svc->region_header->block_size : svc->block_size;
     svc->block_data_size = svc->region_header->block_data_size ? svc->region_header->block_data_size : svc->block_data_size;
     svc->block_total_size = svc->block_data_size + DS3_KVC_BLOCK_HEADER_SIZE;
+    pthread_mutex_unlock(&svc->mmap_mutex);
     return 0;
 }
 
@@ -901,7 +976,7 @@ static int service_ensure_mmap(ds3_kv_service_state_t *svc)
 static service_session_cache_t *service_find_session_cache_unlocked(ds3_kv_service_state_t *svc, const char *session_id)
 {
     for (int i = 0; i < DS3_KVC_SERVICE_SESSIONS; i++) {
-        if (svc->sessions[i].valid && strcmp(svc->sessions[i].session_id, session_id) == 0) {
+        if (atomic_load(&svc->sessions[i].valid) && strcmp(svc->sessions[i].session_id, session_id) == 0) {
             return &svc->sessions[i];
         }
     }
@@ -910,12 +985,16 @@ static service_session_cache_t *service_find_session_cache_unlocked(ds3_kv_servi
 
 /* Protects svc->sessions[] against concurrent access from the heartbeat
  * thread and the main engine thread.  Uses wake_mutex because it is also
- * used to serialise all RPC activity on the daemon-side socket. */
+ * used to serialise all RPC activity on the daemon-side socket.
+ *
+ * NOTE: the returned pointer is only valid because the heartbeat thread never
+ * modifies session block cache content, and the engine thread serialises
+ * lookup/read/write for a given session. */
 static service_session_cache_t *service_find_session_cache(ds3_kv_service_state_t *svc, const char *session_id)
 {
     pthread_mutex_lock(&svc->wake_mutex);
     for (int i = 0; i < DS3_KVC_SERVICE_SESSIONS; i++) {
-        if (svc->sessions[i].valid && strcmp(svc->sessions[i].session_id, session_id) == 0) {
+        if (atomic_load(&svc->sessions[i].valid) && strcmp(svc->sessions[i].session_id, session_id) == 0) {
             pthread_mutex_unlock(&svc->wake_mutex);
             return &svc->sessions[i];
         }
@@ -933,8 +1012,8 @@ static service_session_cache_t *service_alloc_session_cache(ds3_kv_service_state
         return s;
     }
     for (int i = 0; i < DS3_KVC_SERVICE_SESSIONS; i++) {
-        if (!svc->sessions[i].valid) {
-            svc->sessions[i].valid = 1;
+        if (!atomic_load(&svc->sessions[i].valid)) {
+            atomic_store(&svc->sessions[i].valid, 1);
             strncpy(svc->sessions[i].session_id, session_id, sizeof(svc->sessions[i].session_id) - 1);
             svc->sessions[i].session_id[sizeof(svc->sessions[i].session_id) - 1] = '\0';
             svc->sessions[i].cached_len = 0;
@@ -1000,6 +1079,13 @@ static ds3_kv_cache_provider_t *service_open(const char *config)
         free(p);
         return NULL;
     }
+    if (pthread_mutex_init(&svc->mmap_mutex, NULL) != 0) {
+        pthread_cond_destroy(&svc->wake_cond);
+        pthread_mutex_destroy(&svc->wake_mutex);
+        free(svc);
+        free(p);
+        return NULL;
+    }
 
     if (pthread_create(&svc->heartbeat_thread, NULL, service_heartbeat_thread, svc) != 0) {
         pthread_cond_destroy(&svc->wake_cond);
@@ -1019,6 +1105,10 @@ static void service_close(ds3_kv_cache_provider_t *p)
     if (!p) return;
     ds3_kv_service_state_t *svc = (ds3_kv_service_state_t *)p->priv;
     if (svc) {
+        /* Intentionally do not send CloseSession RPCs here: the daemon may be
+         * shutting down while the Rust service is unreachable, and blocking on
+         * RPCs would delay process exit.  Orphaned sessions are reclaimed by
+         * the service's heartbeat timeout (default 30s). */
         /* Signal shutdown and wake the heartbeat thread immediately so
          * pthread_join does not have to wait for the next tick. */
         pthread_mutex_lock(&svc->wake_mutex);
@@ -1028,6 +1118,7 @@ static void service_close(ds3_kv_cache_provider_t *p)
         pthread_join(svc->heartbeat_thread, NULL);
         pthread_cond_destroy(&svc->wake_cond);
         pthread_mutex_destroy(&svc->wake_mutex);
+        pthread_mutex_destroy(&svc->mmap_mutex);
         service_disconnect(svc);
         if (svc->mmap_base) munmap(svc->mmap_base, svc->mmap_size);
         if (svc->mmap_fd >= 0) close(svc->mmap_fd);
@@ -1066,7 +1157,7 @@ static int service_close_session(ds3_kv_cache_provider_t *p, const char *session
                           ds3_kvcache_CloseSessionReq_fields, &req,
                           ds3_kvcache_StatusResp_fields, &resp);
     service_session_cache_t *sc = service_find_session_cache(svc, session_id);
-    if (sc) sc->valid = 0;
+    if (sc) atomic_store(&sc->valid, 0);
     return (rc == 0 && resp.ok) ? 0 : -1;
 }
 
@@ -1117,6 +1208,7 @@ static int service_lookup(ds3_kv_cache_provider_t *p,
     decode_string_ctx_t err_ctx = { err_buf, sizeof(err_buf) };
     resp.error.funcs.decode = &decode_string_to_buf;
     resp.error.arg = &err_ctx;
+    resp.cold_loaded_blocks.funcs.decode = &decode_ignore_block_handle;
 
     if (service_call(svc, "Lookup",
                      ds3_kvcache_LookupReq_fields, &req,
@@ -1343,7 +1435,9 @@ static int service_write(ds3_kv_cache_provider_t *p,
     encode_int32_ctx_t tokens_ctx = { tokens, n_tokens, 0 };
     store_req.tokens.funcs.encode = &encode_repeated_int32;
     store_req.tokens.arg = &tokens_ctx;
-    store_req.n_prompt = n_tokens;
+    /* n_prompt is the already-cached prefix length so the service can compute
+     * n_gen = n_tokens - n_prompt. */
+    store_req.n_prompt = cached_len;
     encode_uint64_ctx_t block_ids_ctx = { block_ids, num_new_blocks, 0 };
     store_req.block_ids.funcs.encode = &encode_repeated_uint64;
     store_req.block_ids.arg = &block_ids_ctx;
@@ -1359,6 +1453,10 @@ static int service_write(ds3_kv_cache_provider_t *p,
 
     if (sc) {
         sc->cached_len = n_tokens;
+        /* Clear the in-memory block cache.  The current lookup->read->write
+         * flow never reads after a write in the same round; if a future caller
+         * wants to read the just-written blocks, it must call Lookup again to
+         * refresh sc->blocks from the service index. */
         sc->n_blocks = 0;
     }
     return 0;

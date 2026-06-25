@@ -72,7 +72,7 @@ typedef struct __attribute__((aligned(128))) {
     uint64_t token_hash;
     uint16_t n_tokens;
     uint16_t padding_1;
-    uint32_t padding_2;
+    int32_t  index_pin_count;
     uint64_t block_id;
     char     session_owner[48];
     uint64_t reserved[4];

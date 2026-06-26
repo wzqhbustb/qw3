@@ -747,6 +747,7 @@ if !daemonRunning(socketPath) {
 | -32003 | Context Overflow | 超出 n_ctx |
 | -32004 | Generation Timeout | 生成超时 |
 | -32005 | Engine Error | C engine 内部错误 |
+| -32006 | Request Too Large | 单条 NDJSON 请求超过 `--max-request-size` |
 
 ---
 

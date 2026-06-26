@@ -375,6 +375,14 @@ void ds3_engine_set_kv_provider(ds3_engine_t *engine,
 void ds3_engine_set_session_id(ds3_engine_t *engine,
                                const char *session_id);
 
+/* Prefix-cache statistics from the last generate call. */
+int ds3_engine_last_cached_prefix_len(const ds3_engine_t *engine);
+int ds3_engine_last_new_cached_prefix_len(const ds3_engine_t *engine);
+
+/* Optional hard deadline for a single generate call. seconds <= 0 disables. */
+void ds3_engine_set_generate_deadline(ds3_engine_t *engine, double seconds);
+void ds3_engine_clear_generate_deadline(ds3_engine_t *engine);
+
 /* Tokenizer — implemented in ds3_tokenizer.c, see ds3_tokenizer.h for full API */
 struct ds3_vocab_t;
 int  ds3_tokenize(const struct ds3_engine *engine, const char *text, int *tokens, int max_tokens);

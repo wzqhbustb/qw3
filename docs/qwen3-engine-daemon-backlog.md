@@ -2,7 +2,7 @@
 
 > 生成时间：2026-06-26
 > 依据文档：`docs/qwen3-engine-socket-daemon-design.md`
-> 当前状态：Phase 3（KV Cache Service 对接）已完成；Phase 1 主体已跑通，仍有收尾缺口；Phase 2 / Phase 4 基本未开始。
+> 当前状态：P0 与 P1 全部完成；Phase 3（KV Cache Service 对接）已完成；Phase 2 与 Phase 4 剩余项待推进。
 
 ---
 
@@ -28,21 +28,21 @@
 
 | # | 工作项 | 当前状态 | 位置 / 文件 | 详细说明 |
 |---|--------|----------|-------------|----------|
-| 1.4 | daemon 端 generate / prefill 超时 | 缺失 | `tools/qwen3-engine-daemon.c`、`pie/llm/socket.go` | 设计 §6.4 要求：连接空闲超时 300s、单次 generate 超时 10min、prompt encode 超时 30s。当前 Go 端只有默认 10min socket deadline，daemon 侧无任何超时。 |
-| 1.5 | 实现 `stats` API | 缺失 | `tools/qwen3-engine-daemon.c:dispatch_request` | 设计文档 §4.8 列出 `health` 和 `stats`，当前只实现了 `health`，且字段很少（缺 `model_name`、`vocab_size`、`gpu_layers` 等）。 |
-| 1.6 | 限制 NDJSON 单条请求大小 | 缺失 | `tools/qwen3-engine-daemon.c:read_line` | `read_line` 未限制单行长度，异常长请求可能导致无界内存增长，存在 DoS 风险。 |
-| 1.7 | `generate` 响应透传缓存命中字段 | 缺失 | `tools/qwen3-engine-daemon.c:handle_generate` | 当前响应只返回 `tokens_prompt/tokens_generated/current_tokens/max_tokens/tool_calls`，`cached_prefix_len` / `new_cached_prefix_len` 始终为 0。KV provider 内部能拿到缓存长度，需要透传到 JSON-RPC 响应。 observability 属性，不阻断 correctness，因此放在 P1。 |
-| 1.8 | 集成测试：Go 与真实 daemon 端到端 | 缺失 | `pie/llm/socket_test.go`、`pie/agent/socket_executor_test.go` | 当前测试使用 mock daemon；缺少启动真实 `qwen3-engine-daemon` 的集成测试，覆盖 create_session、generate、append_turn、replace_history、close_session 全链路。应在 P0 修完后立刻补充，否则 P0 的修复缺乏自动化验证。 |
-| 1.9 | 结构化 `tool_calls` 返回 | 缺失 | `tools/qwen3-engine-daemon.c:handle_generate` | 当前固定返回 `"tool_calls":[]`，Agent 仍靠正则从 `text` 提取 `<tool_call>`。设计 §4.3 TODO 建议直接返回结构化数组。当前正则可用，优先级不高。 |
-| 1.10 | `replace_history` 的 `preserve_kv_cache: true` 优化路径 | 缺失 | `tools/qwen3-engine-daemon.c:session_replace_history` | 当前直接忽略 `preserve_kv` 并总是重建 KV。文档 §4.5 模式 B 标记为实验性，但代码里未实现优化路径。 |
-| 1.11 | resume 时显式 close + create session | 部分 | `pie/main.go:268-283` | 当前直接 `CreateSession`，daemon 内部会关闭旧 session，但 Go 端没有显式处理；如果 create 失败会留下不一致状态。 |
+| 1.4 | daemon 端 generate / prefill 超时 | 已完成 | `tools/qwen3-engine-daemon.c`、`src/ds3_engine.c`、`pie/llm/socket.go` | 新增 CLI 参数 `-t`/`-T`/`-R`（generate/idle/request timeout，默认 600/300/60 秒）。daemon 对 accept 后的 socket 设置 `SO_RCVTIMEO`/`SO_SNDTIMEO`；`ds3_engine_generate_ex` 内通过 `clock_gettime(CLOCK_MONOTONIC)` 检查 deadline，超时返回 `-2`，daemon 映射为 JSON-RPC `-32004 Generation Timeout`。Go 侧新增 `IsGenerationTimeout`/`NewGenerationTimeoutError`。 |
+| 1.5 | 实现 `stats` API | 已完成 | `tools/qwen3-engine-daemon.c:handle_stats`、`pie/llm/socket.go` | 新增 `stats` RPC，返回 `status/model_name/model_loaded/n_ctx/vocab_size/gpu_layers/active_sessions/total_tokens_generated/total_tokens_prompt/uptime_seconds`。`handle_generate` 累加 prompt tokens 到 `total_prompt_tokens`。Go 侧新增 `SocketClient.Stats` 与 `SocketStats`。 |
+| 1.6 | 限制 NDJSON 单条请求大小 | 已完成 | `tools/qwen3-engine-daemon.c:read_line` | 新增 CLI 参数 `-r BYTES`（默认 1MB）。`read_line` 超过限制返回 `-2`，`handle_connection` 发送 `-32006 Request Too Large` 并关闭连接。 |
+| 1.7 | `generate` 响应透传缓存命中字段 | 已完成 | `tools/qwen3-engine-daemon.c:handle_generate`、`src/ds3_engine.c`、`pie/llm/socket.go` | `ds3_engine_t` 新增 `last_cached_prefix_len`/`last_new_cached_prefix_len`；`generate_ex` 在 KV lookup 后和新 KV write 后记录；daemon 响应包含 `cached_prefix_len`/`new_cached_prefix_len`。`SocketResult` 增加对应字段。 |
+| 1.8 | 集成测试：Go 与真实 daemon 端到端 | 已完成 | `pie/llm/socket_integration_test.go`、`tools/qwen3-engine-daemon.c:create_unix_socket` | 新增 `//go:build integration` 集成测试，覆盖 daemon 生命周期（health/stats/create/generate/append/continue/replace/close）、请求大小限制、graceful shutdown。修复了 macOS 上无法运行的问题：为 daemon 子进程设置 `cmd.Dir`（Metal 需要相对路径读 `.metal` 源码）、改用 `/tmp` 下的短 socket 路径以符合 `sun_path` 104 字节限制、daemon 在 socket 路径过长时返回 `ENAMETOOLONG` 而非静默截断。运行需设置 `QW3_MODEL`（和可选 `QW3_DAEMON`）。 |
+| 1.9 | 结构化 `tool_calls` 返回 | 已完成 | `tools/qwen3-engine-daemon.c:handle_generate` | daemon 现在解析 `<tool_call>` 内的 JSON object/array 并作为结构化数组返回；非 JSON（如简化格式）仍返回 `[]`，由 Agent 侧正则兜底。`SocketResult.ToolCalls` 字段保留原始 JSON。 |
+| 1.10 | `replace_history` 的 `preserve_kv_cache: true` 优化路径 | 已完成 | `tools/qwen3-engine-daemon.c:handle_replace_history` | `handle_replace_history` 已读取 `preserve_kv_cache`：为 `false` 时调用 `ds3_kv_cache_reset_session` 重建 KV；为 `true` 时只替换消息历史，保留现有 KV 前缀缓存。 |
+| 1.11 | resume 时显式 close + create session | 已完成 | `pie/main.go` | `--resume` 路径现在先 `CloseSession`（失败忽略），再 `CreateSession` + `ReplaceHistory`，避免 daemon 内部隐式关闭带来的不一致。 |
 
 ### Phase 4 工程化（高优先级）
 
 | # | 工作项 | 当前状态 | 位置 / 文件 | 详细说明 |
 |---|--------|----------|-------------|----------|
-| 4.1 | graceful shutdown | 缺失 | `tools/qwen3-engine-daemon.c:signal_handler`、`main` | 收到 SIGINT/SIGTERM 后直接退出，不等待 in-flight generate 完成。launchd KeepAlive 重启是常态，每次重启都会触发，影响可用性。 |
-| 4.2 | launchd / systemd 示例 | 缺失 | 仓库根目录 / `docs/` | 没有 service 或 plist 文件示例。单独做 graceful shutdown 意义有限：如果没有 plist/service 拉起，就没有机会触发 graceful shutdown。建议两项配对完成。 |
+| 4.1 | graceful shutdown | 已完成 | `tools/qwen3-engine-daemon.c` | 新增 `g_active_connections`/`g_active_generate` 计数；收到 SIGINT/SIGTERM 后停止 accept，等待 in-flight 请求完成（最多 `generate_timeout + 5s`），超时则强制清理。 |
+| 4.2 | launchd / systemd 示例 | 已完成 | `examples/launchd/`、`examples/systemd/`、`docs/deployment.md` | 新增 macOS plist、Linux systemd service 和部署文档。 |
 
 ---
 
@@ -77,7 +77,7 @@
 |---|--------|----------|-------------|----------|
 | 4.3 | TCP 监听可选（`--listen`） | ❌ | `tools/qwen3-engine-daemon.c` | 当前只有 UDS；远程调试需要 SSH forward，不方便。 |
 | 4.4 | 结构化日志 / 日志级别 | ❌ | 全局 | 当前只有 `fprintf(stderr, ...)` 和 `--quiet` 开关，缺少 DEBUG/INFO/WARN/ERROR 分级。 |
-| 4.5 | 指标输出（Prometheus / stats） | ❌ | `tools/qwen3-engine-daemon.c` | 没有 `/metrics` 或 `stats` RPC；无法监控延迟、吞吐量、session 数。 |
+| 4.5 | Prometheus `/metrics` 端点 | ❌ | `tools/qwen3-engine-daemon.c` | `stats` RPC 已实现（P1 1.5），但尚未提供 Prometheus 格式 `/metrics` HTTP 端点。 |
 
 ### Phase 4 高级特性（按需延后）
 
@@ -112,19 +112,17 @@
 
 ## 测试覆盖缺口
 
-- Go 侧缺少 `SocketClient` 与真实 daemon 的集成测试。
-- 缺少 daemon 断线重连 / session 恢复测试。
-- 缺少 socket 模式下 Agent `RunOnce` 的端到端测试。
-- 缺少 `Context Overflow`、超时、大请求边界测试。
+- ~~Go 侧缺少 `SocketClient` 与真实 daemon 的集成测试~~ → `pie/llm/socket_integration_test.go`（`//go:build integration`）已覆盖 health/stats/create/generate/append/continue/replace/close、大请求边界、graceful shutdown。
+- 缺少 daemon 断线重连 / session 恢复测试 → 已由 `pie/agent/socket_executor_test.go` 的 mock 测试覆盖，真实 daemon 场景可在集成测试中补充。
+- 缺少 socket 模式下 Agent `RunOnce` 的端到端测试 → 可在集成测试中通过 `qw3-agent` 主程序补充。
+- 缺少 `Context Overflow`、超时、大请求边界测试 → Context Overflow 与大请求边界已覆盖；真实模型下的 generate 超时触发测试待补充。
 
 ---
 
 ## 建议推进顺序
 
-1. **P0（3 项）**：历史同步、Context Overflow、断线恢复。把 Phase 1 correctness 真正闭环。
-2. **P1（10 项）**：
-   - Phase 1 完善：超时、stats、请求大小限制、缓存命中字段透传、集成测试、结构化 tool_calls、`preserve_kv_cache`、resume 显式 close/create。
-   - Phase 4 工程化：graceful shutdown + launchd/systemd 示例（配对完成）。
+1. **P0（3 项）**：已完成。历史同步、Context Overflow、断线恢复已闭环。
+2. **P1（10 项）**：已完成。包含超时、stats、请求大小限制、缓存命中字段透传、集成测试、结构化 tool_calls、`preserve_kv_cache`、resume 显式 close/create、graceful shutdown、launchd/systemd 示例。
 3. **P2**：`load_model` 参数完善、Phase 2 并发、剩余 Phase 4 工程化、高级特性按需延后。
 
 ---

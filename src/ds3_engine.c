@@ -126,6 +126,14 @@ struct ds3_engine {
     char                     session_id[64];
     void                    *kv_cache_host; /* [n_ctx][2][n_layer][n_kv_head][head_dim] FP16 */
     size_t                   kv_cache_host_bytes;
+
+    /* Statistics from the last generate call for observability. */
+    int last_cached_prefix_len;
+    int last_new_cached_prefix_len;
+
+    /* Optional hard deadline for the current generate call. */
+    struct timespec generate_deadline;
+    int generate_timeout_enabled;
 };
 
 /* ============================================================================
@@ -3111,6 +3119,8 @@ static bool is_stop_token(const ds3_engine_t *e, int token_id)
     return false;
 }
 
+static bool generate_deadline_expired(ds3_engine_t *e);
+
 int ds3_engine_generate_ex(ds3_engine_t *e,
                            const int *prompt_tokens,
                            int n_prompt,
@@ -3132,6 +3142,8 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
 
     srand((unsigned)time(NULL));
     e->seq_len = 0;
+    e->last_cached_prefix_len = 0;
+    e->last_new_cached_prefix_len = 0;
 
     if (getenv("DS3_CHUNK_DEBUG") != NULL) {
         debug_compare_chunk_and_token(e, prompt_tokens, n_prompt);
@@ -3150,6 +3162,7 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
                                            &cached_len) == 0) {
             if (cached_len < 0) cached_len = 0;
             if (cached_len > n_prompt) cached_len = n_prompt;
+            e->last_cached_prefix_len = cached_len;
             if (cached_len > 0) {
                 if (ensure_kv_cache_host(e) == 0 &&
                     e->kv_provider->vtable->read(e->kv_provider, e->session_id,
@@ -3171,12 +3184,15 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
     /* -------------------------------------------------------------------------
      * Prefill remaining tokens
      * ------------------------------------------------------------------------- */
+    if (generate_deadline_expired(e)) return -2;
+
     if (cached_len == n_prompt && n_prompt > 0) {
         /* Entire prompt is cached.  Run the last token once to obtain the
          * first decode logit. */
         e->seq_len = n_prompt - 1;
         next_token = forward_token(e, prompt_tokens[n_prompt - 1], temperature);
         if (next_token < 0) return -1;
+        if (generate_deadline_expired(e)) return -2;
         e->seq_len++;
     } else {
         /* Chunk prefill is now the default.  Users can opt out with
@@ -3208,6 +3224,7 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
 
             int prompt_pos = cached_len;
             while (prompt_pos < n_prompt) {
+                if (generate_deadline_expired(e)) return -2;
                 int remaining = n_prompt - prompt_pos;
                 int chunk = remaining < chunk_size ? remaining : chunk_size;
                 next_token = forward_chunk(e, prompt_tokens + prompt_pos, chunk, temperature);
@@ -3217,6 +3234,7 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
             }
         } else {
             for (int i = cached_len; i < n_prompt; i++) {
+                if (generate_deadline_expired(e)) return -2;
                 next_token = forward_token(e, prompt_tokens[i], temperature);
                 if (next_token < 0) return -1;
                 e->seq_len++;
@@ -3227,6 +3245,7 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
 
     int n_gen = 0;
     for (int i = 0; i < n_predict && n_gen < output_capacity && e->seq_len < e->n_ctx; i++) {
+        if (generate_deadline_expired(e)) return -2;
         if (is_stop_token(e, next_token)) break;
 
         output_tokens[n_gen++] = next_token;
@@ -3245,6 +3264,7 @@ int ds3_engine_generate_ex(ds3_engine_t *e,
     /* Write prompt + generated tokens KV back so future turns can reuse
      * the full prefix including the assistant response. */
     int total_len = n_prompt + n_gen;
+    e->last_new_cached_prefix_len = total_len;
     if (e->kv_provider && e->session_id[0] != '\0' && total_len > 0) {
         if (ensure_kv_cache_host(e) == 0 &&
             kv_cache_download(e, total_len, e->kv_cache_host) == 0) {
@@ -3299,6 +3319,55 @@ void ds3_print_model_info(const ds3_engine_t *e)
     ds3_weights_print_summary(e->weights);
     ds3_print_info("\nKV cache: %d layers x %d tokens x %d kv_heads x %d head_dim (FP16)\n",
            DS3_N_LAYER, e->n_ctx, DS3_N_HEAD_KV, DS3_HEAD_DIM);
+}
+
+int ds3_engine_last_cached_prefix_len(const ds3_engine_t *e)
+{
+    return e ? e->last_cached_prefix_len : 0;
+}
+
+int ds3_engine_last_new_cached_prefix_len(const ds3_engine_t *e)
+{
+    return e ? e->last_new_cached_prefix_len : 0;
+}
+
+void ds3_engine_set_generate_deadline(ds3_engine_t *e, double seconds)
+{
+    if (!e) return;
+    if (seconds <= 0) {
+        e->generate_timeout_enabled = 0;
+        return;
+    }
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        e->generate_timeout_enabled = 0;
+        return;
+    }
+    long extra_sec = (long)seconds;
+    long extra_nsec = (long)((seconds - extra_sec) * 1e9);
+    e->generate_deadline.tv_sec = now.tv_sec + extra_sec;
+    e->generate_deadline.tv_nsec = now.tv_nsec + extra_nsec;
+    if (e->generate_deadline.tv_nsec >= 1000000000L) {
+        e->generate_deadline.tv_sec++;
+        e->generate_deadline.tv_nsec -= 1000000000L;
+    }
+    e->generate_timeout_enabled = 1;
+}
+
+void ds3_engine_clear_generate_deadline(ds3_engine_t *e)
+{
+    if (!e) return;
+    e->generate_timeout_enabled = 0;
+}
+
+static bool generate_deadline_expired(ds3_engine_t *e)
+{
+    if (!e || !e->generate_timeout_enabled) return false;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
+    if (now.tv_sec > e->generate_deadline.tv_sec) return true;
+    if (now.tv_sec < e->generate_deadline.tv_sec) return false;
+    return now.tv_nsec >= e->generate_deadline.tv_nsec;
 }
 
 int ds3_engine_chat_format(const ds3_engine_t *e, const char *system,

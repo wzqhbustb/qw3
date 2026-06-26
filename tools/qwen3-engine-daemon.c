@@ -16,6 +16,8 @@
 #include "src/ds3.h"
 
 #define ERR_CONTEXT_OVERFLOW -32003
+#define ERR_GENERATION_TIMEOUT -32004
+#define ERR_REQUEST_TOO_LARGE  -32006
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -349,6 +351,9 @@ typedef struct {
     int session_capacity;
     int n_ctx;
     int total_generated;
+    int total_prompt_tokens;
+    size_t max_request_size;
+    double generate_timeout;
     time_t started_at;
 } daemon_state_t;
 
@@ -618,9 +623,9 @@ static void session_append_message(session_t *s, const char *role,
     s->last_active = time(NULL);
 }
 
-static void session_replace_history(session_t *s, bool preserve_kv,
-                                    const msg_t *msgs, int n_msgs) {
-    (void)preserve_kv; /* Phase 1 always rebuilds */
+/* Replace the in-memory conversation history.  KV-cache preservation is decided
+ * by the caller (handle_replace_history) before/after this function runs. */
+static void session_replace_history(session_t *s, const msg_t *msgs, int n_msgs) {
     for (int i = 0; i < s->n_messages; i++) msg_free(&s->messages[i]);
     s->n_messages = 0;
     for (int i = 0; i < n_msgs; i++) {
@@ -752,6 +757,82 @@ static char *strip_think_blocks(const char *text) {
     return strdup(answer);
 }
 
+/* Extract structured tool calls from assistant text.  Supports JSON objects or
+ * arrays inside <tool_call>...</tool_call> tags.  Returns a newly allocated
+ * JSON array string (e.g. "[{\"tool\":\"read\"}]"), or NULL if no valid JSON
+ * tool calls are found.  The caller must free the returned string. */
+static char *extract_tool_calls_json(const char *text) {
+    if (!text) return NULL;
+    buf_t out = {0};
+    buf_puts(&out, "[");
+    bool first = true;
+    const char *p = text;
+    for (;;) {
+        const char *start = strstr(p, "<tool_call>");
+        if (!start) break;
+        const char *end = strstr(start, "</tool_call>");
+        if (!end) break;
+        const char *body = start + strlen("<tool_call>");
+        while (body < end && isspace((unsigned char)*body)) body++;
+        const char *body_end = end;
+        while (body_end > body && isspace((unsigned char)body_end[-1])) body_end--;
+        size_t len = (size_t)(body_end - body);
+        if (len == 0) {
+            p = end + strlen("</tool_call>");
+            continue;
+        }
+        char *item = (char *)malloc(len + 1);
+        memcpy(item, body, len);
+        item[len] = '\0';
+
+        /* Validate that the body looks like JSON (object or array). */
+        bool ok = false;
+        if (item[0] == '{' || item[0] == '[') {
+            /* Simple structural check: braces/brackets must balance. */
+            int depth = 0;
+            bool in_string = false;
+            ok = true;
+            for (size_t i = 0; i < len; i++) {
+                if (item[i] == '"' && (i == 0 || item[i - 1] != '\\')) {
+                    in_string = !in_string;
+                } else if (!in_string) {
+                    if (item[i] == '{' || item[i] == '[') depth++;
+                    else if (item[i] == '}' || item[i] == ']') depth--;
+                    if (depth < 0) { ok = false; break; }
+                }
+            }
+            if (ok && depth != 0) ok = false;
+        }
+
+        if (ok) {
+            if (!first) buf_puts(&out, ",");
+            first = false;
+            if (item[0] == '[') {
+                /* Inline array contents without surrounding brackets. */
+                buf_append(&out, item + 1, len - 2);
+            } else {
+                buf_puts(&out, item);
+            }
+        }
+        free(item);
+        p = end + strlen("</tool_call>");
+    }
+    buf_puts(&out, "]");
+    if (first) {
+        buf_free(&out);
+        return NULL;
+    }
+    return buf_take(&out);
+}
+
+/* ============================================================================
+ * Global server state
+ * ============================================================================ */
+
+static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_active_connections = 0;
+static volatile sig_atomic_t g_active_generate = 0;
+
 /* ============================================================================
  * Generation
  * ============================================================================ */
@@ -760,7 +841,9 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
                                 const char *user_prompt, const char *context,
                                 float temperature, int max_tokens,
                                 char **out_text, int *out_prompt_tokens,
-                                int *out_gen_tokens) {
+                                int *out_gen_tokens,
+                                int *out_cached_prefix_len,
+                                int *out_new_cached_prefix_len) {
     buf_t prompt_buf = {0};
     build_chat_prompt(s, user_prompt, context, &prompt_buf);
 
@@ -805,10 +888,18 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
         s->provider_session_created = 1;
     }
 
+    g_active_generate++;
+    ds3_engine_set_generate_deadline(ds->engine, ds->generate_timeout);
     int n_gen = ds3_engine_generate_ex(ds->engine, prompt_tokens, n_prompt,
                                        max_gen, temp,
                                        output_tokens, max_gen, NULL, NULL);
+    ds3_engine_clear_generate_deadline(ds->engine);
+    g_active_generate--;
     free(prompt_tokens);
+    if (n_gen == -2) {
+        free(output_tokens);
+        return -3;
+    }
     if (n_gen < 0) {
         free(output_tokens);
         return -1;
@@ -833,8 +924,11 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
     *out_text = stripped;
     *out_prompt_tokens = n_prompt;
     *out_gen_tokens = n_gen;
+    *out_cached_prefix_len = ds3_engine_last_cached_prefix_len(ds->engine);
+    *out_new_cached_prefix_len = ds3_engine_last_new_cached_prefix_len(ds->engine);
     s->total_generated += n_gen;
     ds->total_generated += n_gen;
+    ds->total_prompt_tokens += n_prompt;
     s->last_active = time(NULL);
     return 0;
 }
@@ -1075,14 +1169,23 @@ static void handle_generate(daemon_state_t *ds, const request_t *req, int fd) {
 
     char *text = NULL;
     int n_prompt = 0, n_gen = 0;
+    int cached_prefix_len = 0, new_cached_prefix_len = 0;
     int rc = generate_for_session(ds, s, has_user ? user_prompt : "", context,
-                                  req_temp, req_max, &text, &n_prompt, &n_gen);
+                                  req_temp, req_max, &text, &n_prompt, &n_gen,
+                                  &cached_prefix_len, &new_cached_prefix_len);
     free(context);
     if (rc == -2) {
         free(session_id);
         free(user_prompt);
         free(text);
         send_error(fd, req->id, ERR_CONTEXT_OVERFLOW, "context overflow");
+        return;
+    }
+    if (rc == -3) {
+        free(session_id);
+        free(user_prompt);
+        free(text);
+        send_error(fd, req->id, ERR_GENERATION_TIMEOUT, "generation timeout");
         return;
     }
     if (rc != 0) {
@@ -1101,15 +1204,20 @@ static void handle_generate(daemon_state_t *ds, const request_t *req, int fd) {
     session_append_message(s, "assistant", text, NULL, NULL, NULL);
 
     int current_tokens = n_prompt + n_gen;
+    char *tool_calls_json = extract_tool_calls_json(text);
     buf_t b = {0};
     buf_puts(&b, "{\"session_id\":\"");
     json_escape_to_buf(&b, session_id);
     buf_puts(&b, "\",\"text\":\"");
     json_escape_to_buf(&b, text);
-    buf_printf(&b, "\",\"tokens_generated\":%d,\"tokens_prompt\":%d,\"current_tokens\":%d,\"max_tokens\":%d,\"tool_calls\":[]}",
-               n_gen, n_prompt, current_tokens, s->n_ctx);
+    buf_printf(&b, "\",\"tokens_generated\":%d,\"tokens_prompt\":%d,\"current_tokens\":%d,\"max_tokens\":%d,\"n_ctx\":%d,\"cached_prefix_len\":%d,\"new_cached_prefix_len\":%d,\"tool_calls\":",
+               n_gen, n_prompt, current_tokens, s->max_tokens, s->n_ctx,
+               cached_prefix_len, new_cached_prefix_len);
+    buf_puts(&b, tool_calls_json ? tool_calls_json : "[]");
+    buf_puts(&b, "}");
     send_response(fd, req->id, true, b.ptr, 0, NULL);
     buf_free(&b);
+    free(tool_calls_json);
     free(text);
     free(session_id);
 }
@@ -1209,12 +1317,16 @@ static void handle_replace_history(daemon_state_t *ds, const request_t *req, int
     }
     free(messages_json);
 
-    session_replace_history(s, preserve, msgs, n_msgs);
+    session_replace_history(s, msgs, n_msgs);
     for (int i = 0; i < n_msgs; i++) msg_free(&msgs[i]);
     free(msgs);
 
     /* Invalidate KV cache when history is replaced without preserving.
-     * The token sequence has changed so any cached prefix is invalid. */
+     * The token sequence has changed so any cached prefix is invalid.
+     *
+     * preserve=true is only safe when the new history's token prefix matches
+     * the old one (e.g. after append_turn).  Full history replacement, such as
+     * compaction, must reset the cache to avoid using stale logits. */
     if (!preserve && ds->kv_provider) {
         ds3_kv_cache_reset_session(ds->kv_provider, session_id);
     }
@@ -1264,6 +1376,33 @@ static void handle_health(daemon_state_t *ds, const request_t *req, int fd) {
     buf_free(&b);
 }
 
+static void handle_stats(daemon_state_t *ds, const request_t *req, int fd) {
+    buf_t b = {0};
+    buf_printf(&b, "{"
+               "\"status\":\"ok\","
+               "\"model_name\":\"%s\","
+               "\"model_loaded\":%s,"
+               "\"n_ctx\":%d,"
+               "\"vocab_size\":%d,"
+               "\"gpu_layers\":%d,"
+               "\"active_sessions\":%d,"
+               "\"total_tokens_generated\":%d,"
+               "\"total_tokens_prompt\":%d,"
+               "\"uptime_seconds\":%ld"
+               "}",
+               DS3_MODEL_NAME,
+               ds->engine ? "true" : "false",
+               ds->n_ctx,
+               DS3_N_VOCAB,
+               DS3_N_LAYER,
+               ds->n_sessions,
+               ds->total_generated,
+               ds->total_prompt_tokens,
+               (long)(time(NULL) - ds->started_at));
+    send_response(fd, req->id, true, b.ptr, 0, NULL);
+    buf_free(&b);
+}
+
 static void dispatch_request(daemon_state_t *ds, const request_t *req, int fd) {
     if (strcmp(req->method, "load_model") == 0) handle_load_model(ds, req, fd);
     else if (strcmp(req->method, "create_session") == 0) handle_create_session(ds, req, fd);
@@ -1273,6 +1412,7 @@ static void dispatch_request(daemon_state_t *ds, const request_t *req, int fd) {
     else if (strcmp(req->method, "reset_session") == 0) handle_reset_session(ds, req, fd);
     else if (strcmp(req->method, "close_session") == 0) handle_close_session(ds, req, fd);
     else if (strcmp(req->method, "health") == 0) handle_health(ds, req, fd);
+    else if (strcmp(req->method, "stats") == 0) handle_stats(ds, req, fd);
     else send_error(fd, req->id, -32601, "method not found");
 }
 
@@ -1282,24 +1422,51 @@ static void dispatch_request(daemon_state_t *ds, const request_t *req, int fd) {
 
 #define READ_BUF_SIZE 65536
 
-static volatile sig_atomic_t g_stop = 0;
-
 static void signal_handler(int sig) {
     (void)sig;
     g_stop = 1;
 }
 
-static int read_line(int fd, buf_t *b) {
+/* Set read/write timeouts on a connected client socket. */
+static void set_socket_timeouts(int fd, double read_sec, double write_sec) {
+    struct timeval tv;
+    if (read_sec > 0) {
+        long sec = (long)read_sec;
+        long usec = (long)((read_sec - sec) * 1e6);
+        tv.tv_sec = sec;
+        tv.tv_usec = usec;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    if (write_sec > 0) {
+        long sec = (long)write_sec;
+        long usec = (long)((write_sec - sec) * 1e6);
+        tv.tv_sec = sec;
+        tv.tv_usec = usec;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+}
+
+static int read_line(int fd, buf_t *b, size_t max_size) {
     buf_free(b);
     char tmp[4096];
     for (;;) {
         ssize_t n = read(fd, tmp, sizeof(tmp));
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                /* Honor shutdown signal even when a client keeps the
+                 * connection open. Without this, SIGINT during a long-lived
+                 * connection would wait up to SO_RCVTIMEO (-R) before
+                 * returning. */
+                if (g_stop) return -1;
+                continue;
+            }
             return -1;
         }
         if (n == 0) {
             return b->len > 0 ? 1 : 0;
+        }
+        if (b->len + (size_t)n > max_size) {
+            return -2;
         }
         buf_append(b, tmp, (size_t)n);
         /* Check for newline. */
@@ -1311,14 +1478,30 @@ static int read_line(int fd, buf_t *b) {
     }
 }
 
-static void handle_connection(daemon_state_t *ds, int fd) {
+static void handle_connection(daemon_state_t *ds, int fd, double idle_timeout, double request_timeout) {
+    /* read_sec = request_timeout (per-request read), write_sec = idle_timeout (slow writer tolerance) */
+    set_socket_timeouts(fd, request_timeout, idle_timeout);
+    g_active_connections++;
     buf_t line = {0};
-    while (!g_stop && read_line(fd, &line) > 0) {
+    for (;;) {
+        if (g_stop) break;
+        int rc = read_line(fd, &line, ds->max_request_size);
+        if (rc == 0) break;
+        if (rc < 0) {
+            if (rc == -2) {
+                send_error(fd, NULL, ERR_REQUEST_TOO_LARGE, "request too large");
+            }
+            break;
+        }
         /* Trim trailing newline and any \r. */
         while (line.len > 0 && (line.ptr[line.len - 1] == '\n' || line.ptr[line.len - 1] == '\r')) {
             line.ptr[--line.len] = '\0';
         }
-        if (line.len == 0) continue;
+        if (line.len == 0) {
+            buf_free(&line);
+            line.ptr = NULL;
+            continue;
+        }
 
         request_t req = {0};
         if (!parse_request(line.ptr, &req)) {
@@ -1334,6 +1517,7 @@ static void handle_connection(daemon_state_t *ds, int fd) {
         line.ptr = NULL;
     }
     buf_free(&line);
+    g_active_connections--;
 }
 
 static int create_unix_socket(const char *path) {
@@ -1344,6 +1528,11 @@ static int create_unix_socket(const char *path) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        close(fd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
     mode_t old_umask = umask(0077);
@@ -1368,6 +1557,10 @@ static void print_usage(const char *argv0) {
         "  -m PATH   Path to Qwen3 GGUF model\n"
         "  -s PATH   Unix Domain Socket path (default: /tmp/qwen3-engine.sock)\n"
         "  -c N      Context length / KV cache size (default: 4096)\n"
+        "  -r BYTES  Max NDJSON request size (default: 1048576)\n"
+        "  -t SEC    Single generate timeout (default: 600)\n"
+        "  -T SEC    Connection idle timeout (default: 300)\n"
+        "  -R SEC    Per-request read timeout (default: 60)\n"
         "  -k TYPE   KV-cache provider: local, service, fallback, none (default: none)\n"
         "  -K PATH   KV-cache service socket path (default: /tmp/ds3-kv-cache.sock)\n"
         "  -i ID     Daemon ID reported to the KV-cache service (default: pid)\n"
@@ -1386,6 +1579,10 @@ int main(int argc, char **argv) {
     const char *kv_service_path = "/tmp/ds3-kv-cache.sock";
     const char *kv_daemon_id = NULL;
     int n_ctx = 4096;
+    size_t max_request_size = 1024 * 1024;
+    double generate_timeout = 600.0;
+    double idle_timeout = 300.0;
+    double request_timeout = 60.0;
     bool quiet = false;
 
     for (int i = 1; i < argc; i++) {
@@ -1395,6 +1592,18 @@ int main(int argc, char **argv) {
             socket_path = argv[++i];
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             n_ctx = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+            long v = atol(argv[++i]);
+            if (v > 0) max_request_size = (size_t)v;
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            generate_timeout = atof(argv[++i]);
+            if (generate_timeout <= 0) generate_timeout = 600.0;
+        } else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {
+            idle_timeout = atof(argv[++i]);
+            if (idle_timeout <= 0) idle_timeout = 300.0;
+        } else if (strcmp(argv[i], "-R") == 0 && i + 1 < argc) {
+            request_timeout = atof(argv[++i]);
+            if (request_timeout <= 0) request_timeout = 60.0;
         } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
             kv_provider_type = argv[++i];
         } else if (strcmp(argv[i], "-K") == 0 && i + 1 < argc) {
@@ -1422,6 +1631,8 @@ int main(int argc, char **argv) {
 
     daemon_state_t ds = {0};
     ds.n_ctx = n_ctx;
+    ds.max_request_size = max_request_size;
+    ds.generate_timeout = generate_timeout;
     ds.started_at = time(NULL);
 
     if (strcmp(kv_provider_type, "local") == 0) {
@@ -1485,12 +1696,27 @@ int main(int argc, char **argv) {
             fprintf(stderr, "accept failed: %s\n", strerror(errno));
             break;
         }
-        handle_connection(&ds, fd);
+        handle_connection(&ds, fd, idle_timeout, request_timeout);
         close(fd);
     }
 
+    /* Graceful shutdown: stop accepting new connections and wait for in-flight
+     * work to finish (up to the generate timeout, then force cleanup). */
     close(listen_fd);
     unlink(socket_path);
+
+    if (!quiet) {
+        fprintf(stderr, "Shutting down, waiting for active connections/generations...\n");
+    }
+    time_t shutdown_deadline = time(NULL) + (time_t)(generate_timeout > 0 ? generate_timeout : 60.0) + 5;
+    while ((g_active_connections > 0 || g_active_generate > 0) && time(NULL) < shutdown_deadline) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    if (!quiet && (g_active_connections > 0 || g_active_generate > 0)) {
+        fprintf(stderr, "Warning: forced shutdown with %d active connection(s) and %d active generation(s)\n",
+                (int)g_active_connections, (int)g_active_generate);
+    }
     for (int i = 0; i < ds.n_sessions; i++) {
         if (ds.kv_provider && ds.sessions[i]->provider_session_created) {
             ds3_kv_cache_close_session(ds.kv_provider, ds.sessions[i]->id);

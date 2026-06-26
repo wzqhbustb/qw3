@@ -768,13 +768,15 @@ if !daemonRunning(socketPath) {
 - [ ] session 空闲回收（LRU）。
 - [ ] health / stats API。
 
-### Phase 3：KV Cache Service 对接（❌ 阻塞中）
+### Phase 3：KV Cache Service 对接（✅ 已完成）
 
-> **前置依赖**：必须先实现 [ds3-kv-cache-service-plan.md](../ds3-kv-cache-service-plan.md) 中的 Rust KV Cache Service，并定义好与 daemon 的 UDS / mmap 协议。
+> 对应实现见 [ds3-kv-cache-service-plan.md](../ds3-kv-cache-service-plan.md)。
 
-- [ ] daemon 调用 Rust KV Cache Service 进行 `lookup` / `store`。
-- [ ] prefix caching：相同 system prompt / 文件内容自动命中。
-- [ ] 跨进程 zero-copy mmap。
+- [x] daemon 通过 UDS protobuf 调用 Rust KV Cache Service 的 `Config` / `Heartbeat` / `Lookup` / `Allocate` / `Store` / `Stats`。
+- [x] prefix caching：相同 system prompt / 文件内容在多个 session 间自动命中；跨 daemon 时提升为 Global 前缀共享。
+- [x] 跨进程 zero-copy：每个 daemon 拥有独立 L1 SHM arena，其它 daemon 按 `Lookup` 返回的 `shm_name` + offset 以 `O_RDONLY` / `PROT_READ` 只读映射 owner daemon 的 arena。
+- [x] daemon 通过 `--daemon-id <id>` 与 service 交互；service 用 `--max-daemons` 限制并发 arena 数量。
+- [x] service 在 daemon lease 超时/断连后自动迁移其 Global block 到活跃 daemon，并清理 stale SHM arena。
 
 ### Phase 4：工程化（Phase 2 稳定后可启动）
 
@@ -798,16 +800,42 @@ if !daemonRunning(socketPath) {
    - **chat template 格式化一致性（Phase 1 已修复）**：daemon 直接构造与 `agent.go:writeMessage()` 逐字节一致的多轮 prompt，再调用 `ds3_engine_tokenize()`，因此 `replace_history` 重放的历史与 `generate` 自身编码的历史完全等价。
 2. **Compact 后 KV 失效**：`replace_history` 默认重建 KV Cache，会暂时失去前缀缓存优势。`preserve_kv_cache: true` 模式需谨慎验证。
 3. **Metal 资源竞争**：多个 session 同时生成会共享 GPU，Phase 1 串行可避免；Phase 2 需 benchmark 确定 worker 数。
-4. **内存占用**：每个 session 都保留完整 KV cache，长上下文多 session 可能 OOM。需要 `max-sessions` / LRU 上限。
-5. **Session 状态持久化**：daemon 崩溃后 session 丢失。重要对话需要 Agent 自己保存/恢复。
-6. **与 KV Cache Service 的耦合**：初期先让 daemon 本地管理 KV，等 KV Service 稳定后再对接。
+4. **内存占用**：service 按 `--max-daemons` 均分总内存预算，每个 daemon 的 SHM arena 大小固定；多 session 共享同一 system prompt 时内存占用接近“一份共享前缀 + 每 session 增量”。
+5. **Session 状态持久化**：daemon 崩溃后 session 丢失；重要对话需要 Agent 自己保存/恢复。service 侧 prefix index 通过 WAL + snapshot 持久化，重启后同一 `daemon-id` 重连可继续命中历史 Global 前缀。
+6. **与 KV Cache Service 的耦合**：daemon 已不再本地管理跨 session KV，全部走 Rust service；断连后 service 心跳超时（默认 30s，可用 `--heartbeat-timeout-secs` 调整）会清理孤儿 session 并迁移 Global block。
 7. **跨平台**：UDS 在 Linux/macOS 可用；Windows 需要 TCP fallback。
 
 ---
 
-## 13. 下一步建议
+## 13. 使用示例
 
-1. 先完成 Phase 1 最小 daemon，跑通 “Agent → Socket → generate → response” 端到端。
-2. 同步把 `qwen3-engine-daemon.c` 的 Makefile 目标加进去。
-3. 用现有 `/Volumes/ExtremeSSD/qwen3-engine/models/Qwen3-30B-A3B-Q4_K_M.gguf` 做基准测试，对比 Subprocess / `-i` / Socket 三种模式的首 token 延迟与总耗时。
+启动 KV Cache service（tiered 模式，1 GiB 总预算，最多 2 个 daemon）：
+
+```bash
+./ds3-kv-cache-svc --tiered \
+    -s /tmp/ds3-kv-cache.sock \
+    -p /tmp/ds3-kv-cache-dir \
+    -m 1073741824 \
+    --max-daemons 2
+```
+
+启动 daemon 并接入 service：
+
+```bash
+./qwen3-engine-daemon \
+    -m /path/to/Qwen3-30B-A3B-Q4_K_M.gguf \
+    -s /tmp/qwen3-engine.sock \
+    -c 2048 \
+    -k service \
+    -K /tmp/ds3-kv-cache.sock \
+    -i daemon1
+```
+
+跨 daemon 共享前缀时，第二个 daemon 使用 `-i daemon2`，其 `lookup` 会返回 daemon1 的 SHM arena 名，daemon2 以只读方式映射该 arena。
+
+## 14. 下一步建议
+
+1. 跑通 `tests/test_two_daemon_cross_read.py` 与 `tests/test_milestone3_acceptance.py` 验证跨 daemon 共享与生命周期。
+2. 使用 `tests/test_performance_baseline.py` 采集 10 session / 128 token 输出场景下的延迟与内存基线。
+3. 根据基线结果调整 `--max-daemons`、内存预算与 Global promotion 阈值。
 

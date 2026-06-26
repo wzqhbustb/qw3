@@ -9,6 +9,9 @@
 PB_BIND(ds3_kvcache_Empty, ds3_kvcache_Empty, AUTO)
 
 
+PB_BIND(ds3_kvcache_ConfigReq, ds3_kvcache_ConfigReq, AUTO)
+
+
 PB_BIND(ds3_kvcache_ConfigResp, ds3_kvcache_ConfigResp, AUTO)
 
 

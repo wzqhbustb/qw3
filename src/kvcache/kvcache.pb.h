@@ -20,6 +20,12 @@ typedef struct _ds3_kvcache_Empty {
     char dummy_field;
 } ds3_kvcache_Empty;
 
+typedef struct _ds3_kvcache_ConfigReq {
+    /* Identifies the daemon requesting configuration.  The service uses this
+ to return the daemon's own SHM arena name in tiered mode. */
+    pb_callback_t daemon_id;
+} ds3_kvcache_ConfigReq;
+
 typedef struct _ds3_kvcache_ConfigResp {
     bool ok;
     pb_callback_t error;
@@ -75,6 +81,9 @@ typedef struct _ds3_kvcache_BlockHandle {
     /* Same value as mmap_offset.  Prefer this field for new clients; it is
  backend-agnostic. */
     uint64_t offset;
+    /* Daemon that owns the physical block.  In tiered mode this identifies
+ which SHM arena the block was allocated from. */
+    pb_callback_t owner_daemon_id;
 } ds3_kvcache_BlockHandle;
 
 typedef struct _ds3_kvcache_LookupResp {
@@ -147,6 +156,7 @@ extern "C" {
 #define _ds3_kvcache_StorageMode_ARRAYSIZE ((ds3_kvcache_StorageMode)(ds3_kvcache_StorageMode_TIERED+1))
 
 
+
 #define ds3_kvcache_ConfigResp_storage_mode_ENUMTYPE ds3_kvcache_StorageMode
 
 
@@ -165,13 +175,14 @@ extern "C" {
 
 /* Initializer values for message structs */
 #define ds3_kvcache_Empty_init_default           {0}
+#define ds3_kvcache_ConfigReq_init_default       {{{NULL}, NULL}}
 #define ds3_kvcache_ConfigResp_init_default      {0, {{NULL}, NULL}, {{NULL}, NULL}, 0, 0, 0, 0, 0, 0, {{NULL}, NULL}, {{NULL}, NULL}, _ds3_kvcache_StorageMode_MIN}
 #define ds3_kvcache_CreateSessionReq_init_default {{{NULL}, NULL}}
 #define ds3_kvcache_CloseSessionReq_init_default {{{NULL}, NULL}}
 #define ds3_kvcache_ResetSessionReq_init_default {{{NULL}, NULL}}
 #define ds3_kvcache_StatusResp_init_default      {0, {{NULL}, NULL}}
 #define ds3_kvcache_LookupReq_init_default       {{{NULL}, NULL}, {{NULL}, NULL}}
-#define ds3_kvcache_BlockHandle_init_default     {0, 0, {{NULL}, NULL}, 0}
+#define ds3_kvcache_BlockHandle_init_default     {0, 0, {{NULL}, NULL}, 0, {{NULL}, NULL}}
 #define ds3_kvcache_LookupResp_init_default      {0, {{NULL}, NULL}, 0, {{NULL}, NULL}, 0, {{NULL}, NULL}}
 #define ds3_kvcache_AllocateReq_init_default     {{{NULL}, NULL}, 0, {{NULL}, NULL}}
 #define ds3_kvcache_AllocateResp_init_default    {0, {{NULL}, NULL}, {{NULL}, NULL}}
@@ -180,13 +191,14 @@ extern "C" {
 #define ds3_kvcache_StatsResp_init_default       {0, {{NULL}, NULL}, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define ds3_kvcache_RpcRequest_init_default      {{{NULL}, NULL}, {{NULL}, NULL}}
 #define ds3_kvcache_Empty_init_zero              {0}
+#define ds3_kvcache_ConfigReq_init_zero          {{{NULL}, NULL}}
 #define ds3_kvcache_ConfigResp_init_zero         {0, {{NULL}, NULL}, {{NULL}, NULL}, 0, 0, 0, 0, 0, 0, {{NULL}, NULL}, {{NULL}, NULL}, _ds3_kvcache_StorageMode_MIN}
 #define ds3_kvcache_CreateSessionReq_init_zero   {{{NULL}, NULL}}
 #define ds3_kvcache_CloseSessionReq_init_zero    {{{NULL}, NULL}}
 #define ds3_kvcache_ResetSessionReq_init_zero    {{{NULL}, NULL}}
 #define ds3_kvcache_StatusResp_init_zero         {0, {{NULL}, NULL}}
 #define ds3_kvcache_LookupReq_init_zero          {{{NULL}, NULL}, {{NULL}, NULL}}
-#define ds3_kvcache_BlockHandle_init_zero        {0, 0, {{NULL}, NULL}, 0}
+#define ds3_kvcache_BlockHandle_init_zero        {0, 0, {{NULL}, NULL}, 0, {{NULL}, NULL}}
 #define ds3_kvcache_LookupResp_init_zero         {0, {{NULL}, NULL}, 0, {{NULL}, NULL}, 0, {{NULL}, NULL}}
 #define ds3_kvcache_AllocateReq_init_zero        {{{NULL}, NULL}, 0, {{NULL}, NULL}}
 #define ds3_kvcache_AllocateResp_init_zero       {0, {{NULL}, NULL}, {{NULL}, NULL}}
@@ -196,6 +208,7 @@ extern "C" {
 #define ds3_kvcache_RpcRequest_init_zero         {{{NULL}, NULL}, {{NULL}, NULL}}
 
 /* Field tags (for use in manual encoding/decoding) */
+#define ds3_kvcache_ConfigReq_daemon_id_tag      1
 #define ds3_kvcache_ConfigResp_ok_tag            1
 #define ds3_kvcache_ConfigResp_error_tag         2
 #define ds3_kvcache_ConfigResp_mmap_path_tag     3
@@ -219,6 +232,7 @@ extern "C" {
 #define ds3_kvcache_BlockHandle_mmap_offset_tag  2
 #define ds3_kvcache_BlockHandle_shm_name_tag     3
 #define ds3_kvcache_BlockHandle_offset_tag       4
+#define ds3_kvcache_BlockHandle_owner_daemon_id_tag 5
 #define ds3_kvcache_LookupResp_ok_tag            1
 #define ds3_kvcache_LookupResp_error_tag         2
 #define ds3_kvcache_LookupResp_cached_prefix_len_tag 3
@@ -260,6 +274,11 @@ extern "C" {
 
 #define ds3_kvcache_Empty_CALLBACK NULL
 #define ds3_kvcache_Empty_DEFAULT NULL
+
+#define ds3_kvcache_ConfigReq_FIELDLIST(X, a) \
+X(a, CALLBACK, SINGULAR, STRING,   daemon_id,         1)
+#define ds3_kvcache_ConfigReq_CALLBACK pb_default_field_callback
+#define ds3_kvcache_ConfigReq_DEFAULT NULL
 
 #define ds3_kvcache_ConfigResp_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     ok,                1) \
@@ -308,7 +327,8 @@ X(a, CALLBACK, REPEATED, INT32,    tokens,            2)
 X(a, STATIC,   SINGULAR, UINT64,   block_id,          1) \
 X(a, STATIC,   SINGULAR, UINT64,   mmap_offset,       2) \
 X(a, CALLBACK, SINGULAR, STRING,   shm_name,          3) \
-X(a, STATIC,   SINGULAR, UINT64,   offset,            4)
+X(a, STATIC,   SINGULAR, UINT64,   offset,            4) \
+X(a, CALLBACK, SINGULAR, STRING,   owner_daemon_id,   5)
 #define ds3_kvcache_BlockHandle_CALLBACK pb_default_field_callback
 #define ds3_kvcache_BlockHandle_DEFAULT NULL
 
@@ -379,6 +399,7 @@ X(a, CALLBACK, SINGULAR, BYTES,    payload,           2)
 #define ds3_kvcache_RpcRequest_DEFAULT NULL
 
 extern const pb_msgdesc_t ds3_kvcache_Empty_msg;
+extern const pb_msgdesc_t ds3_kvcache_ConfigReq_msg;
 extern const pb_msgdesc_t ds3_kvcache_ConfigResp_msg;
 extern const pb_msgdesc_t ds3_kvcache_CreateSessionReq_msg;
 extern const pb_msgdesc_t ds3_kvcache_CloseSessionReq_msg;
@@ -396,6 +417,7 @@ extern const pb_msgdesc_t ds3_kvcache_RpcRequest_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define ds3_kvcache_Empty_fields &ds3_kvcache_Empty_msg
+#define ds3_kvcache_ConfigReq_fields &ds3_kvcache_ConfigReq_msg
 #define ds3_kvcache_ConfigResp_fields &ds3_kvcache_ConfigResp_msg
 #define ds3_kvcache_CreateSessionReq_fields &ds3_kvcache_CreateSessionReq_msg
 #define ds3_kvcache_CloseSessionReq_fields &ds3_kvcache_CloseSessionReq_msg
@@ -412,6 +434,7 @@ extern const pb_msgdesc_t ds3_kvcache_RpcRequest_msg;
 #define ds3_kvcache_RpcRequest_fields &ds3_kvcache_RpcRequest_msg
 
 /* Maximum encoded size of messages (where known) */
+/* ds3_kvcache_ConfigReq_size depends on runtime parameters */
 /* ds3_kvcache_ConfigResp_size depends on runtime parameters */
 /* ds3_kvcache_CreateSessionReq_size depends on runtime parameters */
 /* ds3_kvcache_CloseSessionReq_size depends on runtime parameters */

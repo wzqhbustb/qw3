@@ -1353,6 +1353,7 @@ static void print_usage(const char *argv0) {
         "  -c N      Context length / KV cache size (default: 4096)\n"
         "  -k TYPE   KV-cache provider: local, service, fallback, none (default: none)\n"
         "  -K PATH   KV-cache service socket path (default: /tmp/ds3-kv-cache.sock)\n"
+        "  -i ID     Daemon ID reported to the KV-cache service (default: pid)\n"
         "  -q        Quiet mode\n",
         argv0);
 }
@@ -1366,6 +1367,7 @@ int main(int argc, char **argv) {
     const char *socket_path = "/tmp/qwen3-engine.sock";
     const char *kv_provider_type = "none";
     const char *kv_service_path = "/tmp/ds3-kv-cache.sock";
+    const char *kv_daemon_id = NULL;
     int n_ctx = 4096;
     bool quiet = false;
 
@@ -1380,6 +1382,8 @@ int main(int argc, char **argv) {
             kv_provider_type = argv[++i];
         } else if (strcmp(argv[i], "-K") == 0 && i + 1 < argc) {
             kv_service_path = argv[++i];
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            kv_daemon_id = argv[++i];
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
             quiet = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1406,7 +1410,13 @@ int main(int argc, char **argv) {
     if (strcmp(kv_provider_type, "local") == 0) {
         ds.kv_provider = ds3_kv_cache_provider_open(&ds3_kv_local_provider, NULL);
     } else if (strcmp(kv_provider_type, "service") == 0) {
-        ds.kv_provider = ds3_kv_cache_provider_open(&ds3_kv_service_provider, kv_service_path);
+        char service_config[320];
+        if (kv_daemon_id && kv_daemon_id[0]) {
+            snprintf(service_config, sizeof(service_config), "%s|%s", kv_service_path, kv_daemon_id);
+        } else {
+            snprintf(service_config, sizeof(service_config), "%s", kv_service_path);
+        }
+        ds.kv_provider = ds3_kv_cache_provider_open(&ds3_kv_service_provider, service_config);
     } else if (strcmp(kv_provider_type, "fallback") == 0) {
         ds.kv_provider = ds3_kv_cache_provider_open(&ds3_kv_fallback_provider, NULL);
     } else if (strcmp(kv_provider_type, "none") != 0) {

@@ -400,9 +400,19 @@ const struct ds3_kv_cache_provider_vtable ds3_kv_local_provider = {
 
 #define DS3_KVC_SERVICE_MAX_BLOCKS 4096
 #define DS3_KVC_SERVICE_SESSIONS   64
+#define DS3_KVC_MAX_ARENAS         16
+
+typedef struct {
+    char name[64];
+    int fd;
+    uint8_t *base;
+    size_t size;
+    ds3_kv_region_header_t *region_header;
+} service_arena_t;
 
 typedef struct {
     ds3_kv_block_handle_t handle;
+    char shm_name[64]; /* arena owning this block; empty => caller's own arena */
     int start_token;   /* inclusive token position this block covers */
     int n_tokens;      /* actual token count stored in this block */
 } service_block_t;
@@ -420,12 +430,12 @@ typedef struct {
     char socket_path[256];
     int connected;
 
-    /* mmap */
-    char mmap_path[256];
-    int mmap_fd;
-    uint8_t *mmap_base;
-    size_t mmap_size;
-    ds3_kv_region_header_t *region_header;
+    /* One or more mapped arenas.  Arena 0 is this daemon's own arena; additional
+     * arenas are opened lazily when a cross-daemon lookup returns blocks owned
+     * by another daemon. */
+    service_arena_t arenas[DS3_KVC_MAX_ARENAS];
+    int n_arenas;
+    int own_arena_idx;         /* index of this daemon's own arena, or -1 */
 
     uint32_t block_size;       /* tokens per block */
     uint64_t block_total_size; /* header + kv data */
@@ -678,14 +688,19 @@ static bool decode_repeated_block_handle(pb_istream_t *stream, const pb_field_t 
     decode_blocks_ctx_t *ctx = (decode_blocks_ctx_t *)*arg;
     if (ctx->n_blocks >= ctx->max_blocks) return false;
     ds3_kvcache_BlockHandle bh = ds3_kvcache_BlockHandle_init_zero;
-    bh.shm_name.funcs.decode = &decode_ignore_string;
+    service_block_t *out = &ctx->blocks[ctx->n_blocks];
+    out->shm_name[0] = '\0';
+    decode_string_ctx_t shm_ctx = { out->shm_name, sizeof(out->shm_name) };
+    bh.shm_name.funcs.decode = &decode_string_to_buf;
+    bh.shm_name.arg = &shm_ctx;
+    bh.owner_daemon_id.funcs.decode = &decode_ignore_string;
     if (!pb_decode(stream, ds3_kvcache_BlockHandle_fields, &bh)) return false;
-    ctx->blocks[ctx->n_blocks].handle.block_id = bh.block_id;
+    out->handle.block_id = bh.block_id;
     /* Prefer the backend-agnostic offset field; fall back to the legacy
      * mmap_offset for older services. */
-    ctx->blocks[ctx->n_blocks].handle.mmap_offset = bh.offset ? bh.offset : bh.mmap_offset;
-    ctx->blocks[ctx->n_blocks].start_token = 0;
-    ctx->blocks[ctx->n_blocks].n_tokens = 0;
+    out->handle.mmap_offset = bh.offset ? bh.offset : bh.mmap_offset;
+    out->start_token = 0;
+    out->n_tokens = 0;
     ctx->n_blocks++;
     return true;
 }
@@ -866,20 +881,103 @@ static void *service_heartbeat_thread(void *arg)
  * SHM arena management
  * ------------------------------------------------------------------------ */
 
+static service_arena_t *service_find_arena(ds3_kv_service_state_t *svc, const char *name)
+{
+    for (int i = 0; i < svc->n_arenas; i++) {
+        if (strcmp(svc->arenas[i].name, name) == 0) return &svc->arenas[i];
+    }
+    return NULL;
+}
+
+static int service_add_arena(ds3_kv_service_state_t *svc, const char *name,
+                             int fd, uint8_t *base, size_t size)
+{
+    if (svc->n_arenas >= DS3_KVC_MAX_ARENAS) {
+        munmap(base, size);
+        close(fd);
+        return -1;
+    }
+    service_arena_t *a = &svc->arenas[svc->n_arenas++];
+    strncpy(a->name, name, sizeof(a->name) - 1);
+    a->name[sizeof(a->name) - 1] = '\0';
+    a->fd = fd;
+    a->base = base;
+    a->size = size;
+    a->region_header = (ds3_kv_region_header_t *)base;
+    return (int)(a - svc->arenas);
+}
+
+static int service_open_arena(ds3_kv_service_state_t *svc, const char *name, bool read_only)
+{
+    service_arena_t *existing = service_find_arena(svc, name);
+    if (existing) return (int)(existing - svc->arenas);
+
+    int fd = shm_open(name, read_only ? O_RDONLY : O_RDWR, 0666);
+    if (fd < 0) {
+        ds3_log_warn("kv-cache failed to shm_open %s: %s\n", name, strerror(errno));
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
+    size_t size = (size_t)st.st_size;
+    if (size < DS3_KVC_REGION_HEADER_SIZE) {
+        close(fd);
+        return -1;
+    }
+
+    int prot = read_only ? PROT_READ : (PROT_READ | PROT_WRITE);
+    uint8_t *base = (uint8_t *)mmap(NULL, size, prot, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        close(fd);
+        return -1;
+    }
+
+    ds3_kv_region_header_t *hdr = (ds3_kv_region_header_t *)base;
+    if (hdr->magic != DS3_KVC_REGION_MAGIC || hdr->version != DS3_KVC_VERSION) {
+        munmap(base, size);
+        close(fd);
+        return -1;
+    }
+
+    return service_add_arena(svc, name, fd, base, size);
+}
+
+static service_arena_t *service_arena_for_read(ds3_kv_service_state_t *svc, const char *shm_name)
+{
+    pthread_mutex_lock(&svc->mmap_mutex);
+    service_arena_t *a = NULL;
+    if (!shm_name || shm_name[0] == '\0') {
+        if (svc->own_arena_idx >= 0) a = &svc->arenas[svc->own_arena_idx];
+    } else {
+        /* Cross-daemon reads only need read access to the owner's arena. */
+        int idx = service_open_arena(svc, shm_name, true);
+        if (idx >= 0) a = &svc->arenas[idx];
+    }
+    pthread_mutex_unlock(&svc->mmap_mutex);
+    return a;
+}
+
 static int service_ensure_shm_arena(ds3_kv_service_state_t *svc)
 {
     /* Hold mmap_mutex while checking and initialising the backing region so
-     * that two threads cannot both see mmap_base == NULL and both try to
+     * that two threads cannot both see the own arena missing and both try to
      * mmap/open the same resource.  mmap_mutex is separate from wake_mutex so
      * the heartbeat thread is not blocked during the GetConfig RPC. */
     pthread_mutex_lock(&svc->mmap_mutex);
 
-    if (svc->mmap_base) {
+    if (svc->own_arena_idx >= 0) {
         pthread_mutex_unlock(&svc->mmap_mutex);
         return 0;
     }
 
-    ds3_kvcache_Empty req = ds3_kvcache_Empty_init_zero;
+    ds3_kvcache_ConfigReq req = ds3_kvcache_ConfigReq_init_zero;
+    req.daemon_id.funcs.encode = &encode_string;
+    req.daemon_id.arg = (void *)svc->daemon_id;
+
     ds3_kvcache_ConfigResp resp = ds3_kvcache_ConfigResp_init_zero;
     char mmap_path[256] = {0};
     char shm_name[256] = {0};
@@ -899,7 +997,7 @@ static int service_ensure_shm_arena(ds3_kv_service_state_t *svc)
     resp.error.arg = &err_ctx;
 
     if (service_call(svc, "GetConfig",
-                     ds3_kvcache_Empty_fields, &req,
+                     ds3_kvcache_ConfigReq_fields, &req,
                      ds3_kvcache_ConfigResp_fields, &resp) != 0) {
         pthread_mutex_unlock(&svc->mmap_mutex);
         return -1;
@@ -915,58 +1013,47 @@ static int service_ensure_shm_arena(ds3_kv_service_state_t *svc)
     if (svc->per_token_kv_bytes <= 0) svc->per_token_kv_bytes = 98304;
     svc->block_data_size = (uint64_t)svc->block_size * (uint64_t)svc->per_token_kv_bytes;
     svc->block_total_size = svc->block_data_size + DS3_KVC_BLOCK_HEADER_SIZE;
-    svc->mmap_size = (size_t)resp.mmap_size;
-    if (svc->mmap_size == 0) svc->mmap_size = (size_t)svc->block_total_size * 1024 + DS3_KVC_REGION_HEADER_SIZE;
 
-    int fd = -1;
-    const char *target_name = NULL;
+    int arena_idx = -1;
     if (resp.storage_mode == ds3_kvcache_StorageMode_TIERED) {
         if (shm_name[0] == '\0') {
             ds3_log_warn("kv-cache tiered mode returned empty shm_name\n");
             pthread_mutex_unlock(&svc->mmap_mutex);
             return -1;
         }
-        fd = shm_open(shm_name, O_RDWR, 0666);
-        target_name = shm_name;
+        arena_idx = service_open_arena(svc, shm_name, false);
     } else {
         if (mmap_path[0] == '\0') {
             ds3_log_warn("kv-cache mmap mode returned empty mmap_path\n");
             pthread_mutex_unlock(&svc->mmap_mutex);
             return -1;
         }
-        fd = open(mmap_path, O_RDWR);
-        target_name = mmap_path;
+        int fd = open(mmap_path, O_RDWR);
+        if (fd < 0) {
+            ds3_log_warn("kv-cache failed to open %s: %s\n", mmap_path, strerror(errno));
+            pthread_mutex_unlock(&svc->mmap_mutex);
+            return -1;
+        }
+        size_t mmap_size = (size_t)resp.mmap_size;
+        if (mmap_size == 0) mmap_size = (size_t)svc->block_total_size * 1024 + DS3_KVC_REGION_HEADER_SIZE;
+        uint8_t *base = (uint8_t *)mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (base == MAP_FAILED) {
+            close(fd);
+            pthread_mutex_unlock(&svc->mmap_mutex);
+            return -1;
+        }
+        arena_idx = service_add_arena(svc, mmap_path, fd, base, mmap_size);
     }
-    if (fd < 0) {
-        ds3_log_warn("kv-cache failed to open %s: %s\n", target_name, strerror(errno));
-        pthread_mutex_unlock(&svc->mmap_mutex);
-        return -1;
-    }
-    svc->mmap_fd = fd;
-    strncpy(svc->mmap_path, target_name, sizeof(svc->mmap_path) - 1);
 
-    uint8_t *base = (uint8_t *)mmap(NULL, svc->mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (base == MAP_FAILED) {
-        close(fd);
-        svc->mmap_fd = -1;
-        pthread_mutex_unlock(&svc->mmap_mutex);
-        return -1;
-    }
-    svc->mmap_base = base;
-    svc->region_header = (ds3_kv_region_header_t *)base;
-
-    if (svc->region_header->magic != DS3_KVC_REGION_MAGIC ||
-        svc->region_header->version != DS3_KVC_VERSION) {
-        munmap(base, svc->mmap_size);
-        close(fd);
-        svc->mmap_base = NULL;
-        svc->mmap_fd = -1;
+    if (arena_idx < 0) {
         pthread_mutex_unlock(&svc->mmap_mutex);
         return -1;
     }
 
-    svc->block_size = svc->region_header->block_size ? svc->region_header->block_size : svc->block_size;
-    svc->block_data_size = svc->region_header->block_data_size ? svc->region_header->block_data_size : svc->block_data_size;
+    svc->own_arena_idx = arena_idx;
+    ds3_kv_region_header_t *hdr = svc->arenas[arena_idx].region_header;
+    svc->block_size = hdr->block_size ? hdr->block_size : svc->block_size;
+    svc->block_data_size = hdr->block_data_size ? hdr->block_data_size : svc->block_data_size;
     svc->block_total_size = svc->block_data_size + DS3_KVC_BLOCK_HEADER_SIZE;
     pthread_mutex_unlock(&svc->mmap_mutex);
     return 0;
@@ -1056,12 +1143,24 @@ static ds3_kv_cache_provider_t *service_open(const char *config)
     if (!svc) { free(p); return NULL; }
 
     svc->fd = -1;
-    svc->mmap_fd = -1;
+    svc->n_arenas = 0;
+    svc->own_arena_idx = -1;
     svc->last_heartbeat = 0;
     svc->shutdown = 0;
     snprintf(svc->daemon_id, sizeof(svc->daemon_id), "%d", (int)getpid());
     if (config && config[0]) {
-        strncpy(svc->socket_path, config, sizeof(svc->socket_path) - 1);
+        /* Format: "socket_path" or "socket_path|daemon_id". */
+        const char *sep = strchr(config, '|');
+        if (sep) {
+            size_t path_len = (size_t)(sep - config);
+            if (path_len >= sizeof(svc->socket_path)) path_len = sizeof(svc->socket_path) - 1;
+            memcpy(svc->socket_path, config, path_len);
+            svc->socket_path[path_len] = '\0';
+            strncpy(svc->daemon_id, sep + 1, sizeof(svc->daemon_id) - 1);
+            svc->daemon_id[sizeof(svc->daemon_id) - 1] = '\0';
+        } else {
+            strncpy(svc->socket_path, config, sizeof(svc->socket_path) - 1);
+        }
     } else {
         strncpy(svc->socket_path, DS3_KVC_SOCKET_PATH, sizeof(svc->socket_path) - 1);
     }
@@ -1120,8 +1219,10 @@ static void service_close(ds3_kv_cache_provider_t *p)
         pthread_mutex_destroy(&svc->wake_mutex);
         pthread_mutex_destroy(&svc->mmap_mutex);
         service_disconnect(svc);
-        if (svc->mmap_base) munmap(svc->mmap_base, svc->mmap_size);
-        if (svc->mmap_fd >= 0) close(svc->mmap_fd);
+        for (int i = 0; i < svc->n_arenas; i++) {
+            if (svc->arenas[i].base) munmap(svc->arenas[i].base, svc->arenas[i].size);
+            if (svc->arenas[i].fd >= 0) close(svc->arenas[i].fd);
+        }
         free(svc);
     }
     free(p);
@@ -1249,14 +1350,28 @@ static int service_lookup(ds3_kv_cache_provider_t *p,
     int pos = 0;
     for (int i = 0; i < sc->n_blocks; i++) {
         sc->blocks[i].start_token = pos;
+        service_arena_t *a = service_arena_for_read(svc, sc->blocks[i].shm_name);
+        if (!a) {
+            sc->cached_len = 0;
+            sc->n_blocks = 0;
+            *out_cached_len = 0;
+            return 0;
+        }
         size_t header_off = sc->blocks[i].handle.mmap_offset - DS3_KVC_BLOCK_HEADER_SIZE;
-        ds3_kv_block_header_t *bh = (ds3_kv_block_header_t *)(svc->mmap_base + header_off);
+        if (header_off + DS3_KVC_BLOCK_HEADER_SIZE > a->size) {
+            sc->cached_len = 0;
+            sc->n_blocks = 0;
+            *out_cached_len = 0;
+            return 0;
+        }
+        ds3_kv_block_header_t *bh = (ds3_kv_block_header_t *)(a->base + header_off);
         if (bh->magic == DS3_KVC_BLOCK_MAGIC && bh->state == DS3_KVC_BLOCK_VALID) {
             sc->blocks[i].n_tokens = bh->n_tokens;
         } else {
             /* Fallback: assume full block except possibly the last one. */
             int remaining = sc->cached_len - pos;
-            int chunk = (int)svc->block_size < remaining ? (int)svc->block_size : remaining;
+            int block_size = a->region_header->block_size ? a->region_header->block_size : svc->block_size;
+            int chunk = block_size < remaining ? block_size : remaining;
             sc->blocks[i].n_tokens = chunk;
         }
         pos += sc->blocks[i].n_tokens;
@@ -1272,7 +1387,7 @@ static int service_read(ds3_kv_cache_provider_t *p,
                         void *kv_buffer)
 {
     ds3_kv_service_state_t *svc = (ds3_kv_service_state_t *)p->priv;
-    if (!svc->mmap_base || !kv_buffer) return -1;
+    if (svc->n_arenas == 0 || !kv_buffer) return -1;
     service_session_cache_t *sc = service_find_session_cache(svc, session_id);
     if (!sc || sc->cached_len < start_pos + n_tokens) return -1;
 
@@ -1281,10 +1396,8 @@ static int service_read(ds3_kv_cache_provider_t *p,
      *   [L0_K(tok 0..P-1)][L0_V(tok 0..P-1)]...[L47_V(tok 0..P-1)]
      * mmap blocks are token-interleaved (matching Rust BlockStore layout):
      *   [tok0(all layers K+V)][tok1(all layers K+V)]...
-     * so we transpose block -> host here. */
-    int ptl_bytes = (int)svc->region_header->n_kv_head
-                  * (int)svc->region_header->head_dim * (int)DS3_KVC_DEFAULT_DTYPE_SIZE;
-    int n_layer = (int)svc->region_header->n_layer;
+     * so we transpose block -> host here.  Layout parameters come from the
+     * arena that actually owns the block, not from this daemon's own arena. */
     int copied = 0;
     for (int i = 0; i < sc->n_blocks && copied < n_tokens; i++) {
         service_block_t *b = &sc->blocks[i];
@@ -1293,8 +1406,23 @@ static int service_read(ds3_kv_cache_provider_t *p,
         int read_end = (start_pos + n_tokens) < block_end ? (start_pos + n_tokens) : block_end;
         if (read_start >= read_end) continue;
 
+        service_arena_t *a = service_arena_for_read(svc, b->shm_name);
+        if (!a) return -1;
+
+        int ptl_bytes = (int)a->region_header->n_kv_head
+                      * (int)a->region_header->head_dim * (int)DS3_KVC_DEFAULT_DTYPE_SIZE;
+        int n_layer = (int)a->region_header->n_layer;
+
         int tok_offset = read_start - b->start_token;
         int n = read_end - read_start;
+
+        /* Bound-check the whole token span inside the source arena. */
+        size_t src_end = b->handle.mmap_offset
+                       + (size_t)(tok_offset + n) * svc->per_token_kv_bytes;
+        if (src_end > a->size) {
+            ds3_log_warn("kv-cache read out of arena bounds: %zu > %zu\n", src_end, a->size);
+            return -1;
+        }
 
         for (int t = 0; t < n; t++) {
             int global_token = read_start + t;
@@ -1306,12 +1434,12 @@ static int service_read(ds3_kv_cache_provider_t *p,
                 size_t src_k = src_token_base + (size_t)(2*l) * ptl_bytes;
                 size_t dst_k = (size_t)(2*l) * n_tokens * ptl_bytes
                              + (size_t)out_token * ptl_bytes;
-                memcpy(dst + dst_k, svc->mmap_base + src_k, (size_t)ptl_bytes);
+                memcpy(dst + dst_k, a->base + src_k, (size_t)ptl_bytes);
                 /* V */
                 size_t src_v = src_token_base + (size_t)(2*l+1) * ptl_bytes;
                 size_t dst_v = (size_t)(2*l+1) * n_tokens * ptl_bytes
                              + (size_t)out_token * ptl_bytes;
-                memcpy(dst + dst_v, svc->mmap_base + src_v, (size_t)ptl_bytes);
+                memcpy(dst + dst_v, a->base + src_v, (size_t)ptl_bytes);
             }
         }
         copied += n;
@@ -1377,15 +1505,16 @@ static int service_write(ds3_kv_cache_provider_t *p,
     }
     if (alloc_blocks_ctx.n_blocks != num_new_blocks) return -1;
 
+    service_arena_t *own = &svc->arenas[svc->own_arena_idx];
     const uint8_t *src = (const uint8_t *)kv_buffer;
     /* Host buffer is layer-interleaved:
      *   [L0_K(tok 0..P-1)][L0_V(tok 0..P-1)]...[L47_V(tok 0..P-1)]
      * mmap blocks are token-interleaved (matching Rust BlockStore layout):
      *   [tok0(all layers K+V)][tok1(all layers K+V)]...
      * so we transpose host -> block here. */
-    int ptl_bytes = (int)svc->region_header->n_kv_head
-                  * (int)svc->region_header->head_dim * (int)DS3_KVC_DEFAULT_DTYPE_SIZE;
-    int n_layer = (int)svc->region_header->n_layer;
+    int ptl_bytes = (int)own->region_header->n_kv_head
+                  * (int)own->region_header->head_dim * (int)DS3_KVC_DEFAULT_DTYPE_SIZE;
+    int n_layer = (int)own->region_header->n_layer;
 
     for (int i = 0; i < num_new_blocks; i++) {
         int start = cached_len + i * svc->block_size;
@@ -1402,12 +1531,12 @@ static int service_write(ds3_kv_cache_provider_t *p,
                 size_t src_k = (size_t)(2*l) * n_tokens * ptl_bytes
                              + (size_t)global_token * ptl_bytes;
                 size_t dst_k = dst_token_base + (size_t)(2*l) * ptl_bytes;
-                memcpy(svc->mmap_base + dst_k, src + src_k, (size_t)ptl_bytes);
+                memcpy(own->base + dst_k, src + src_k, (size_t)ptl_bytes);
                 /* V */
                 size_t src_v = (size_t)(2*l+1) * n_tokens * ptl_bytes
                              + (size_t)global_token * ptl_bytes;
                 size_t dst_v = dst_token_base + (size_t)(2*l+1) * ptl_bytes;
-                memcpy(svc->mmap_base + dst_v, src + src_v, (size_t)ptl_bytes);
+                memcpy(own->base + dst_v, src + src_v, (size_t)ptl_bytes);
             }
         }
     }
@@ -1419,7 +1548,7 @@ static int service_write(ds3_kv_cache_provider_t *p,
         int start_tok = cached_len + i * svc->block_size;
         int end_tok = start_tok + svc->block_size;
         if (end_tok > n_tokens) end_tok = n_tokens;
-        uint8_t *ptr = svc->mmap_base + new_blocks[i].handle.mmap_offset;
+        uint8_t *ptr = own->base + new_blocks[i].handle.mmap_offset;
         size_t len = (size_t)(end_tok - start_tok) * svc->per_token_kv_bytes;
         msync(ptr, len, MS_SYNC);
     }

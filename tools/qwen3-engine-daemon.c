@@ -15,6 +15,8 @@
 
 #include "src/ds3.h"
 
+#define ERR_CONTEXT_OVERFLOW -32003
+
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -778,6 +780,14 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
         free(prompt_tokens);
         return -1;
     }
+    /* ds3_tokenize silently truncates to max_prompt.  If we got back the
+     * entire buffer the prompt is at least n_ctx tokens long and there is no
+     * room left for generation.  Report this as a context overflow so the
+     * client can compact or reset instead of treating it as a generic failure. */
+    if (n_prompt >= max_prompt) {
+        free(prompt_tokens);
+        return -2;
+    }
 
     int max_gen = max_tokens > 0 ? max_tokens : s->max_tokens;
     int *output_tokens = (int *)malloc((size_t)max_gen * sizeof(int));
@@ -1068,6 +1078,13 @@ static void handle_generate(daemon_state_t *ds, const request_t *req, int fd) {
     int rc = generate_for_session(ds, s, has_user ? user_prompt : "", context,
                                   req_temp, req_max, &text, &n_prompt, &n_gen);
     free(context);
+    if (rc == -2) {
+        free(session_id);
+        free(user_prompt);
+        free(text);
+        send_error(fd, req->id, ERR_CONTEXT_OVERFLOW, "context overflow");
+        return;
+    }
     if (rc != 0) {
         free(session_id);
         free(user_prompt);

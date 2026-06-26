@@ -21,7 +21,7 @@ Socket Daemon 要解决的核心问题：
 2. **真正的多 session**：每个 session 有独立的 KV Cache 上下文。
 3. **任意长度 prompt**：不再受 CLI 行缓冲限制。
 4. **结构化协议**：JSON / protobuf 请求响应，告别 stdout 解析。
-5. **Agent 原生集成**：Go 客户端通过 socket 调用，与现有 `llm.Backend` 接口对齐。
+5. **Agent 原生集成**：Go 客户端通过 socket 调用，采用 `SocketClient` + `SocketExecutor` 架构与 daemon 增量式交互。
 
 ---
 
@@ -31,10 +31,10 @@ Socket Daemon 要解决的核心问题：
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Agent (Go)                                   │
 │                                                                      │
-│   ┌─────────────────┐    ┌──────────────────┐                       │
-│   │ SubprocessBackend│    │ SocketBackend    │  ← 可插拔            │
-│   │ (fallback)       │    │ (recommended)    │                       │
-│   └────────┬────────┘    └────────┬─────────┘                       │
+│   ┌─────────────────┐    ┌────────────────────────────────┐         │
+│   │ SubprocessBackend│    │ SocketClient + SocketExecutor  │  ← 增量式 │
+│   │ (fallback)       │    │ (recommended)                  │         │
+│   └────────┬────────┘    └────────┬────────────────────────┘         │
 │            │                      │                                  │
 └────────────┼──────────────────────┼──────────────────────────────────┘
              │ spawn                │ Unix Domain Socket / TCP
@@ -436,7 +436,7 @@ typedef struct {
 这是整个设计的核心边界：
 
 - **Daemon 是“历史 + KV Cache”的权威来源**；Agent 只保留一份用于 UI / 持久化 / memory 注入的副本。
-- **Agent 不再调用 `buildPrompt()` 生成完整 chat template**。在 SocketBackend 模式下，`buildPrompt` 被禁用或重构为仅用于 memory 摘要注入。
+- **Agent 不再调用 `buildPrompt()` 生成完整 chat template**。在 SocketExecutor 模式下，`buildPrompt` 被禁用或重构为仅用于 memory 摘要注入。
 - Agent 通过增量消息与 daemon 同步：
   - 用户新输入 → `generate(user_prompt)`
   - assistant 输出 → daemon 返回，Agent 追加到 `state.Messages`
@@ -480,7 +480,7 @@ daemon 也可以在响应中附加 warning：
 
 ### 5.4 Compact 流程与 `replace_history` 的时机
 
-Agent 的 `Compact()` 需要通过 LLM 生成历史摘要。在 SocketBackend 模式下，**推荐使用独立的 fallback backend 执行摘要生成**（方案 B），避免污染当前 session 的 KV Cache 和历史。
+Agent 的 `Compact()` 需要通过 LLM 生成历史摘要。在 SocketExecutor 模式下，**推荐使用独立的 fallback backend 执行摘要生成**（方案 B），避免污染当前 session 的 KV Cache 和历史。
 
 **推荐方案 B：fallback SubprocessBackend / 独立 daemon session**
 
@@ -565,38 +565,55 @@ KV(bytes) = n_ctx × n_layer × n_head_kv × head_dim × 2(K+V) × 2(fp16)
 
 ---
 
-## 7. Go 客户端（SocketBackend）
+## 7. Go 客户端（SocketClient + SocketExecutor）
 
-新增 `llm.SocketBackend` 实现 `llm.Backend` 接口，对 Agent 透明。
+实际实现没有采用 `llm.SocketBackend`（prompt-based 的 `llm.Backend` 接口与 daemon 的增量式协议不匹配），而是拆成两层：
+
+- `llm.SocketClient`：负责 NDJSON 编码、socket 连接、重连恢复、各 RPC 方法封装。
+- `agent.SocketExecutor`：实现 `turnExecutor` 接口，对 Agent 核心循环隐藏 daemon 的增量 API。
 
 ```go
-type SocketBackend struct {
+// llm/socket.go
+type SocketClient struct {
     socketPath string
-    dialer     net.Dialer
-    mu         sync.Mutex
-    conn       net.Conn
-    encoder    *json.Encoder
-    decoder    *json.Decoder
+    // ...
 }
 
-func NewSocketBackend(socketPath string) *SocketBackend { ... }
-
-func (b *SocketBackend) Generate(ctx context.Context, prompt string, opts GenerateOpts) (GenerateResult, error) {
-    req := Request{...}
-    resp, err := b.call(ctx, req)
-    return GenerateResult{Content: resp.Result.Text}, nil
-}
+func (c *SocketClient) CreateSession(...) error
+func (c *SocketClient) Generate(...) (*SocketResult, error)
+func (c *SocketClient) AppendTurn(...) error
+func (c *SocketClient) ReplaceHistory(...) error
+func (c *SocketClient) CloseSession(...) error
 ```
 
-> **与 `turnExecutor` 的关系**：`SocketBackend` 是底层通信层，负责 NDJSON 编码、socket 连接、重连恢复；它不直接暴露给 Agent 的核心循环。Agent 通过 §7.4 的 `turnExecutor` 接口与 daemon 交互，`socketExecutor` 内部使用 `SocketBackend` 完成实际 RPC。
+```go
+// agent/socket_executor.go
+type SocketExecutor struct {
+    client  *llm.SocketClient
+    created map[string]bool
+    // ...
+}
 
-Agent 侧只需在 main 里加：
+func (e *SocketExecutor) Generate(ctx, sessionID, userPrompt, systemPrompt string, tools []Tool, opts GenerateOpts) (GenerateResponse, error)
+```
+
+> **架构演进说明**：设计初期曾设想 `llm.SocketBackend` 实现 `llm.Backend` 接口，但 `llm.Backend.Generate(ctx, prompt, opts)` 需要调用方拼接完整 prompt，这与 daemon 的增量式 `generate(user_prompt)` 相矛盾。最终采用 `SocketClient` + `SocketExecutor` 的组合，`SocketExecutor` 内部维护 `created` 标记并增量同步消息，Agent 侧无需再拼接完整 prompt。
+
+Agent 侧实际集成（`pie/main.go`）：
 
 ```go
 if cfg.SocketPath != "" {
-    rawBackend = llm.NewSocketBackend(cfg.SocketPath)
+    if err := ensureDaemonRunning(ctx, cfg); err != nil {
+        return fmt.Errorf("failed to start daemon: %w", err)
+    }
+    client := llm.NewSocketClient(cfg.SocketPath)
+    defer client.Close()
+
+    fallback := llm.NewSubprocessBackend(cfg.QW3CLIPath, cfg.ModelPath)
+    executor := agent.NewSocketExecutor(client, fallback)
+    ag = agent.NewWithExecutor(executor, fallback, registry, state).WithMemory(memStore)
 } else {
-    rawBackend = llm.NewSubprocessBackend(...)
+    ag = agent.New(backend, registry, state).WithMemory(memStore)
 }
 ```
 
@@ -606,7 +623,7 @@ if cfg.SocketPath != "" {
 |---|---|
 | `SubprocessBackend` | 保留作为 fallback |
 | `InteractiveBackend` | 可废弃（被 SocketDaemon 取代） |
-| `MetricsBackend` | 继续包裹 `SocketBackend` |
+| `MetricsBackend` | 可包裹 `SubprocessBackend`；socket 模式下 metrics 建议在 `SocketExecutor` 层统计 |
 | `buildPrompt()` | **重构**：不再构建完整 prompt；改为向 daemon 发送增量 `user_prompt` + `append_turn` |
 | `formatMemoryNotes()` | **改为 `context` 字段**：每轮 memory 检索结果作为 `generate` 的临时上下文注入，不进入 conversation 历史 |
 | `auto-compact` | **适配**：用 daemon 返回的 `current_tokens` / `max_tokens` 做决策，不再用字符数估算 |
@@ -635,7 +652,7 @@ daemon 重建 KV Cache，Agent 与 daemon 状态对齐
 
 ### 7.3 连接生命周期与恢复
 
-`SocketBackend` 默认维护一条长连接。需要处理以下情况：
+`SocketClient` 默认维护一条长连接。需要处理以下情况：
 
 1. **daemon 重启**：连接断开，所有 session 丢失。
 2. **网络/UDS 异常**：`write` / `read` 返回 error。
@@ -657,7 +674,7 @@ replace_history(messages=state.Messages)  // 用 Agent 本地历史重建
 
 设计要点：
 
-- `SocketBackend` 每次写前检查连接活性；失败时自动重连。
+- `SocketClient` 每次写前检查连接活性；失败时自动重连。
 - 重连后必须能根据 `opts.SessionID` 重建 session。
 - 对于 `generate` 这类非幂等请求，重试需要 Agent 层配合（如重新触发一次 generate）。
 
@@ -750,16 +767,18 @@ if !daemonRunning(socketPath) {
 
 ## 11. 实现计划
 
-### Phase 1：最小可运行 daemon（当前重点）
+### Phase 1：最小可运行 daemon（核心已跑通，仍有收尾缺口）
 
-- [ ] 在 `tools/` 下新建 `qwen3-engine-daemon.c`。
-- [ ] 实现 UDS server（**单线程串行处理所有请求**，先保证正确性）。
-- [ ] 实现 `load_model`、`create_session`、`generate`（支持空 `user_prompt` 续生成）、`append_turn`、`replace_history`、`close_session`。
-- [ ] daemon 端维护 session conversation tokens 与 KV Cache。
-- [ ] `generate` 响应返回 `current_tokens` / `max_tokens`。
-- [ ] Go 端实现 `llm.SocketBackend`。
-- [ ] Agent 端重构：`SocketBackend` 模式下禁用 `buildPrompt`，改为增量消息同步；`Compact()` 联动 `replace_history`。
-- [ ] 与 Agent 集成，支持 `--socket` 启动。
+- [x] 在 `tools/` 下新建 `qwen3-engine-daemon.c`。
+- [x] 实现 UDS server（**单线程串行处理所有请求**，先保证正确性）。
+- [x] 实现 `load_model`、`create_session`、`generate`（支持空 `user_prompt` 续生成）、`append_turn`、`replace_history`、`close_session`。
+- [x] daemon 端维护 session conversation tokens 与 KV Cache。
+- [x] `generate` 响应返回 `tokens_prompt` / `tokens_generated` / `current_tokens` / `max_tokens`。
+- [x] Go 端实现 `llm.SocketClient` + `agent.SocketExecutor`（原设计的 `llm.SocketBackend` 因与增量式协议不匹配，由 Executor 架构取代）。
+- [x] Agent 端重构：socket 模式下禁用完整 prompt 构建，改为增量消息同步；`Compact()` 联动 `replace_history`。
+- [x] 与 Agent 集成，支持 `--socket-path` / `--qw3-daemon-path` 启动。
+
+> 收尾缺口见 `docs/qwen3-engine-daemon-backlog.md`：历史同步边界、Context Overflow 错误码、断线恢复、超时控制、缓存命中字段透传等。
 
 ### Phase 2：多 session 与并发（Phase 1 稳定后）
 

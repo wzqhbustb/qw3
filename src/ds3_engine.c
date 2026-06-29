@@ -3331,6 +3331,13 @@ int ds3_engine_last_new_cached_prefix_len(const ds3_engine_t *e)
     return e ? e->last_new_cached_prefix_len : 0;
 }
 
+/* Set a hard wall-clock deadline for the in-progress generate call.
+ *
+ * The deadline is polled at well-defined checkpoints inside ds3_engine_generate_ex
+ * (before/after prefill chunks and before each decode step).  A very small
+ * positive value such as 0.001 therefore causes the current generate call to
+ * return -2 at the next checkpoint, which is how callers request an immediate
+ * but clean abort.  Passing seconds <= 0 disables the deadline. */
 void ds3_engine_set_generate_deadline(ds3_engine_t *e, double seconds)
 {
     if (!e) return;

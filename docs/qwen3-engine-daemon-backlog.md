@@ -2,7 +2,7 @@
 
 > 生成时间：2026-06-26
 > 依据文档：`docs/qwen3-engine-socket-daemon-design.md`
-> 当前状态：P0 与 P1 全部完成；Phase 3（KV Cache Service 对接）已完成；Phase 2 与 Phase 4 剩余项待推进。
+> 当前状态：P0 与 P1 全部完成；Phase 3（KV Cache Service 对接）已完成；Phase 2 核心并发与 2.5 流式 generate 已完成；Phase 4 剩余项待推进。
 
 ---
 
@@ -41,7 +41,7 @@
 
 | # | 工作项 | 当前状态 | 位置 / 文件 | 详细说明 |
 |---|--------|----------|-------------|----------|
-| 4.1 | graceful shutdown | 已完成 | `tools/qwen3-engine-daemon.c` | 新增 `g_active_connections`/`g_active_generate` 计数；收到 SIGINT/SIGTERM 后停止 accept，等待 in-flight 请求完成（最多 `generate_timeout + 5s`），超时则强制清理。 |
+| 4.1 | graceful shutdown | 已完成 | `tools/qwen3-engine-daemon.c` | 收到 SIGINT/SIGTERM 后停止 accept，广播 shutdown 信号，join 所有 worker 线程和 reaper 线程。in-flight generate 由 engine 内部 `generate_timeout` deadline 兜底返回；daemon 侧不再做额外的 force-cleanup，避免损坏 KV cache。 |
 | 4.2 | launchd / systemd 示例 | 已完成 | `examples/launchd/`、`examples/systemd/`、`docs/deployment.md` | 新增 macOS plist、Linux systemd service 和部署文档。 |
 
 ---
@@ -56,7 +56,7 @@
 
 ### Phase 2：多 session 与并发
 
-当前 daemon 为**全局单线程串行**：`accept()` 后直接同步 `handle_connection()`，一个长 `generate` 会阻塞所有其他 session。
+当前 daemon 已改造为**多线程**：主线程只负责 `accept()`，连接派发到 worker 线程池；同 session 请求通过 per-session mutex 串行，所有 `generate` 通过全局 `engine_mutex` 串行。
 
 > ⚠️ **Phase 2 并发收益约束**：Metal command queue 在当前实现下是全局共享的。即使有线程池，多个 session 的 `generate` 也无法在 GPU 上真正并行——GPU 端仍是串行执行。Phase 2 的主要收益是：
 > - 一个 session 在 `generate` 时，另一个 session 的 tokenize/encode 可以并行；
@@ -64,12 +64,12 @@
 
 | # | 工作项 | 当前状态 | 位置 / 文件 | 详细说明 |
 |---|--------|----------|-------------|----------|
-| 2.1 | per-session 请求队列 | ❌ | `tools/qwen3-engine-daemon.c` | 避免同 session 内多个请求竞态，确保同一 session 的 generate 串行。 |
-| 2.2 | 线程池 + `--workers` 参数 | ❌ | `tools/qwen3-engine-daemon.c` | 文档 §6.2 / §8.1 提到可按性能核心数配置 worker 数量。 |
-| 2.3 | 同 session 串行、跨 session 并行 | ❌ | `tools/qwen3-engine-daemon.c` | 当前所有请求全局串行，无法满足设计目标。 |
-| 2.4 | session 空闲超时回收 + `--max-sessions` | ❌ | `tools/qwen3-engine-daemon.c:session_t` | 已记录 `last_active`，但没有定时检查或 LRU 淘汰；文档 §6.3 默认上限 4、空闲超时 300s。 |
-| 2.5 | 流式 generate（`stream: true`） | ❌ | `tools/qwen3-engine-daemon.c`、协议 §3.4 | 文档 §3.4 列为 Phase 2，当前固定非流式。 |
-| 2.6 | 连接空闲超时控制 | ❌ | `tools/qwen3-engine-daemon.c` | 与 Phase 1 超时控制相关，长连接无请求时应自动关闭。 |
+| 2.1 | per-session 请求队列 | 已完成 | `tools/qwen3-engine-daemon.c` | 每个 `session_t` 新增 `pthread_mutex_t mutex`；所有针对 session 的请求（`generate`/`append_turn`/`replace_history`/`reset_session`/`close_session`）先通过 `session_find_and_lock` 或 `session_close` 获取该 session 的互斥锁，确保同一 session 内请求串行执行。 |
+| 2.2 | 线程池 + `--workers` 参数 | 已完成 | `tools/qwen3-engine-daemon.c` | 主线程只负责 `accept()`，连接通过 `enqueue_work` 派发到固定大小的 worker 线程池；新增 `-W N` / `--workers`（默认 4）。 |
+| 2.3 | 同 session 串行、跨 session 并行 | 已完成 | `tools/qwen3-engine-daemon.c` | 同 session 请求由 per-session mutex 串行；跨 session 的非生成请求可并行。所有 `generate` 调用额外持有全局 `engine_mutex`，因为底层 `ds3_engine_t` / Metal 不是线程安全。 |
+| 2.4 | session 空闲超时回收 + `--max-sessions` | 已完成 | `tools/qwen3-engine-daemon.c:session_t` | 新增 `-S SEC` / `--session-timeout`（默认 0，禁用）与 `-M N` / `--max-sessions`（默认 0，不限）。后台 reaper 线程每 5 秒扫描一次，使用 `pthread_mutex_trylock` 关闭空闲超时的 session；`create_session` 在达到上限时尝试淘汰最老的空闲 session，失败则返回 `-32007 Session Limit Reached`。 |
+| 2.5 | 流式 generate（`stream: true`） | 已完成 | `tools/qwen3-engine-daemon.c`、协议 §3.4 | daemon 侧 `generate` 新增可选 `stream` 参数；`stream:true` 时通过 `ds3_engine_generate_ex` 回调逐 token 发送 NDJSON 中间 chunk，最终发送含完整 metadata 与 `done:true` 的结束行，再追加 assistant message。Go 侧 `SocketClient` 新增 `GenerateStream`，使用独立连接读取 NDJSON 行并返回 `<-chan SocketStreamResult`，上下文取消时关闭连接。集成测试 `TestIntegrationGenerateStream` 已添加。 |
+| 2.6 | 连接空闲超时控制 | 已完成 | `tools/qwen3-engine-daemon.c` | 新增 `-I SEC` / `--conn-idle-timeout`（默认 300）。`handle_connection` 在每次读取 NDJSON 前先用 `poll()` 等待数据，超时则关闭连接。 |
 
 ### Phase 4 工程化（剩余）
 

@@ -128,17 +128,19 @@ Socket Daemon 要解决的核心问题：
 }
 ```
 
-### 3.4 流式协议草图（Phase 2）
+### 3.4 流式协议（Phase 2）
 
-> Phase 1 不实现流式，仅保留协议草图供 Phase 2 参考。
-
-`generate` 设置 `"stream": true` 时，daemon 在生成过程中多次发送 `partial`，最后用一条 `result` 收尾。所有消息共享同一个 `id`。
+`generate` 设置 `"stream": true` 时，daemon 复用 JSON-RPC `result` 字段多次返回 NDJSON 行，最后用 `done:true` 收尾。所有消息共享同一个 `id`。
 
 ```json
-{ "id": "2", "partial": { "text": "我会先", "tokens_generated": 3 } }
-{ "id": "2", "partial": { "text": "读取相关", "tokens_generated": 6 } }
-{ "id": "2", "result": { "text": "我会先读取相关文件...", "tokens_generated": 42, "current_tokens": 170, "max_tokens": 4096 } }
+{ "id": "2", "result": { "text": "我会先", "done": false } }
+{ "id": "2", "result": { "text": "我会先读取", "done": false } }
+{ "id": "2", "result": { "session_id": "sess-1", "text": "我会先读取相关文件...", "tokens_generated": 42, "tokens_prompt": 128, "current_tokens": 170, "max_tokens": 2048, "n_ctx": 4096, "cached_prefix_len": 0, "new_cached_prefix_len": 170, "tool_calls": [], "done": true } }
 ```
+
+- 中间 chunk 只包含 `text` 和 `done:false`。
+- 最终 chunk 包含完整 `generate` 元数据、`tool_calls` 数组和 `done:true`。
+- 如果写入失败，daemon 会停止生成并返回 `{"code":-32009,"message":"stream write failed"}` 错误行。
 
 ---
 

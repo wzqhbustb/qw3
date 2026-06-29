@@ -1,13 +1,15 @@
 /*
  * tools/qwen3-engine-daemon.c — Resident Qwen3 inference daemon
  *
- * Phase 1 implementation:
+ * Phase 2 implementation:
  *   - Loads the model once and keeps it resident in memory.
  *   - Speaks NDJSON over a Unix Domain Socket.
  *   - Maintains multiple sessions with independent conversation state.
+ *   - Uses a fixed worker thread pool to serve connections concurrently.
+ *   - Serialises all generate operations on the engine (global engine mutex).
+ *   - Serialises requests targeting the same session (per-session mutex).
  *
  * Limitations:
- *   - Requests are processed serially (Phase 1).
  *   - The underlying ds3_engine_generate_ex resets the KV cache each call, so
  *     the daemon rebuilds the full prompt on every generate.  True incremental
  *     KV-cache reuse requires engine support (Phase 3 / KV Cache Service).
@@ -18,6 +20,9 @@
 #define ERR_CONTEXT_OVERFLOW -32003
 #define ERR_GENERATION_TIMEOUT -32004
 #define ERR_REQUEST_TOO_LARGE  -32006
+#define ERR_SESSION_LIMIT      -32007
+#define ERR_INTERNAL           -32008
+#define ERR_STREAM_WRITE_FAILED -32009
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -27,6 +32,7 @@
 #include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -335,6 +341,8 @@ typedef struct session {
     /* Provider-side session has been created (so we don't recreate it every
      * generate call). */
     int provider_session_created;
+
+    pthread_mutex_t mutex;
 } session_t;
 
 typedef struct {
@@ -343,6 +351,11 @@ typedef struct {
     char *params;      /* raw JSON object text */
 } request_t;
 
+typedef struct work_item {
+    int fd;
+    struct work_item *next;
+} work_item_t;
+
 typedef struct {
     ds3_engine_t *engine;
     ds3_kv_cache_provider_t *kv_provider;
@@ -350,11 +363,32 @@ typedef struct {
     int n_sessions;
     int session_capacity;
     int n_ctx;
-    int total_generated;
-    int total_prompt_tokens;
+    int64_t total_generated;
+    int64_t total_prompt_tokens;
     size_t max_request_size;
     double generate_timeout;
     time_t started_at;
+
+    /* Concurrency state */
+    pthread_mutex_t engine_mutex;
+    pthread_mutex_t sessions_mutex;
+    pthread_mutex_t work_mutex;
+    pthread_cond_t work_cond;
+    work_item_t *work_head;
+    work_item_t *work_tail;
+    int work_count;
+    int max_work_queue;
+    pthread_t *workers;
+    pthread_t reaper_thread;
+    int n_workers;
+    int shutdown;
+
+    /* Timeouts / limits */
+    double send_timeout;
+    double request_timeout;
+    int conn_idle_timeout;
+    int max_sessions;
+    int session_timeout;
 } daemon_state_t;
 
 /* ============================================================================
@@ -542,13 +576,19 @@ static void msg_free(msg_t *m) {
     memset(m, 0, sizeof(*m));
 }
 
-static void session_free(session_t *s) {
+static void session_free_resources(session_t *s) {
     if (!s) return;
     free(s->id);
     free(s->system_prompt);
     for (int i = 0; i < s->n_messages; i++) msg_free(&s->messages[i]);
     free(s->messages);
     free(s);
+}
+
+static void session_destroy(session_t *s) {
+    if (!s) return;
+    pthread_mutex_destroy(&s->mutex);
+    session_free_resources(s);
 }
 
 static session_t *session_find(daemon_state_t *ds, const char *id) {
@@ -558,25 +598,89 @@ static session_t *session_find(daemon_state_t *ds, const char *id) {
     return NULL;
 }
 
+/* Look up a session and return it with its mutex held.  The sessions array
+ * mutex is released before returning. */
+static session_t *session_find_and_lock(daemon_state_t *ds, const char *id) {
+    pthread_mutex_lock(&ds->sessions_mutex);
+    session_t *s = session_find(ds, id);
+    if (s) pthread_mutex_lock(&s->mutex);
+    pthread_mutex_unlock(&ds->sessions_mutex);
+    return s;
+}
+
+/* Remove a session from the array.  Caller must hold sessions_mutex. */
+static void session_remove_at(daemon_state_t *ds, int idx) {
+    session_t *s = ds->sessions[idx];
+    ds->sessions[idx] = ds->sessions[--ds->n_sessions];
+    if (ds->kv_provider && s->provider_session_created) {
+        ds3_kv_cache_close_session(ds->kv_provider, s->id);
+    }
+    pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_destroy(&s->mutex);
+    session_free_resources(s);
+}
+
 static void session_close(daemon_state_t *ds, const char *id) {
+    pthread_mutex_lock(&ds->sessions_mutex);
     for (int i = 0; i < ds->n_sessions; i++) {
         if (strcmp(ds->sessions[i]->id, id) == 0) {
-            if (ds->kv_provider && ds->sessions[i]->provider_session_created) {
-                ds3_kv_cache_close_session(ds->kv_provider, id);
-            }
-            session_free(ds->sessions[i]);
-            ds->sessions[i] = ds->sessions[--ds->n_sessions];
-            return;
+            pthread_mutex_lock(&ds->sessions[i]->mutex);
+            session_remove_at(ds, i);
+            break;
         }
     }
+    pthread_mutex_unlock(&ds->sessions_mutex);
 }
 
 static session_t *session_create(daemon_state_t *ds, const char *id,
                                  const char *system_prompt,
-                                 float temperature, int max_tokens) {
-    session_close(ds, id); /* remove any existing session to avoid dangling pointers */
+                                 float temperature, int max_tokens,
+                                 int *err_code) {
+    pthread_mutex_lock(&ds->sessions_mutex);
+
+    /* Enforce max-sessions limit by evicting the oldest idle session. */
+    if (ds->max_sessions > 0 && ds->n_sessions >= ds->max_sessions) {
+        int oldest_idx = -1;
+        time_t oldest = 0;
+        for (int i = 0; i < ds->n_sessions; i++) {
+            if (pthread_mutex_trylock(&ds->sessions[i]->mutex) == 0) {
+                if (oldest_idx == -1 || ds->sessions[i]->last_active < oldest) {
+                    oldest_idx = i;
+                    oldest = ds->sessions[i]->last_active;
+                }
+                pthread_mutex_unlock(&ds->sessions[i]->mutex);
+            }
+        }
+        if (oldest_idx < 0) {
+            pthread_mutex_unlock(&ds->sessions_mutex);
+            *err_code = ERR_SESSION_LIMIT;
+            return NULL;
+        }
+        pthread_mutex_lock(&ds->sessions[oldest_idx]->mutex);
+        session_remove_at(ds, oldest_idx);
+    }
+
+    /* Replace any existing session with the same id. */
+    for (int i = 0; i < ds->n_sessions; i++) {
+        if (strcmp(ds->sessions[i]->id, id) == 0) {
+            pthread_mutex_lock(&ds->sessions[i]->mutex);
+            session_remove_at(ds, i);
+            break;
+        }
+    }
+
     session_t *s = (session_t *)calloc(1, sizeof(session_t));
-    if (!s) return NULL;
+    if (!s) {
+        pthread_mutex_unlock(&ds->sessions_mutex);
+        *err_code = ERR_INTERNAL;
+        return NULL;
+    }
+    if (pthread_mutex_init(&s->mutex, NULL) != 0) {
+        free(s);
+        pthread_mutex_unlock(&ds->sessions_mutex);
+        *err_code = ERR_INTERNAL;
+        return NULL;
+    }
     s->id = strdup(id);
     s->system_prompt = strdup(system_prompt ? system_prompt : "");
     s->temperature = temperature > 0 ? temperature : 0.7f;
@@ -585,7 +689,9 @@ static session_t *session_create(daemon_state_t *ds, const char *id,
     s->msg_capacity = 16;
     s->messages = (msg_t *)calloc((size_t)s->msg_capacity, sizeof(msg_t));
     if (!s->id || !s->system_prompt || !s->messages) {
-        session_free(s);
+        session_destroy(s);
+        pthread_mutex_unlock(&ds->sessions_mutex);
+        *err_code = ERR_INTERNAL;
         return NULL;
     }
     s->last_active = time(NULL);
@@ -593,13 +699,20 @@ static session_t *session_create(daemon_state_t *ds, const char *id,
         int new_cap = ds->session_capacity ? ds->session_capacity * 2 : 8;
         session_t **tmp = (session_t **)realloc(ds->sessions, (size_t)new_cap * sizeof(session_t *));
         if (!tmp) {
-            session_free(s);
+            session_destroy(s);
+            pthread_mutex_unlock(&ds->sessions_mutex);
+            *err_code = ERR_INTERNAL;
             return NULL;
         }
         ds->sessions = tmp;
         ds->session_capacity = new_cap;
     }
     ds->sessions[ds->n_sessions++] = s;
+    /* Return with the session mutex held so the caller can finish setup
+     * (e.g. KV-cache session creation) before other requests see it. */
+    pthread_mutex_lock(&s->mutex);
+    pthread_mutex_unlock(&ds->sessions_mutex);
+    *err_code = 0;
     return s;
 }
 
@@ -788,18 +901,26 @@ static char *extract_tool_calls_json(const char *text) {
         /* Validate that the body looks like JSON (object or array). */
         bool ok = false;
         if (item[0] == '{' || item[0] == '[') {
-            /* Simple structural check: braces/brackets must balance. */
+            /* Simple structural check: braces/brackets must balance, while
+             * correctly handling escaped quotes and escaped backslashes. */
             int depth = 0;
             bool in_string = false;
+            int backslash_run = 0;
             ok = true;
             for (size_t i = 0; i < len; i++) {
-                if (item[i] == '"' && (i == 0 || item[i - 1] != '\\')) {
+                char c = item[i];
+                if (c == '\\') {
+                    backslash_run++;
+                    continue;
+                }
+                if (c == '"' && (backslash_run % 2) == 0) {
                     in_string = !in_string;
                 } else if (!in_string) {
-                    if (item[i] == '{' || item[i] == '[') depth++;
-                    else if (item[i] == '}' || item[i] == ']') depth--;
+                    if (c == '{' || c == '[') depth++;
+                    else if (c == '}' || c == ']') depth--;
                     if (depth < 0) { ok = false; break; }
                 }
+                backslash_run = 0;
             }
             if (ok && depth != 0) ok = false;
         }
@@ -830,12 +951,69 @@ static char *extract_tool_calls_json(const char *text) {
  * ============================================================================ */
 
 static volatile sig_atomic_t g_stop = 0;
-static volatile sig_atomic_t g_active_connections = 0;
-static volatile sig_atomic_t g_active_generate = 0;
+
+/* Atomic helpers for int64_t counters that are updated under engine_mutex but
+ * read from stats/health without holding that lock. */
+#define atomic_add64(p, v) __sync_fetch_and_add((p), (int64_t)(v))
+#define atomic_load64(p)   __sync_fetch_and_add((p), (int64_t)0)
 
 /* ============================================================================
  * Generation
  * ============================================================================ */
+
+/* State passed to the stream callback so each decoded step can be sent to the
+ * client as an intermediate NDJSON line. */
+typedef struct {
+    ds3_engine_t *engine;
+    int fd;
+    const char *req_id;
+    int *tokens;
+    int count;
+    int capacity;
+    int write_failed;   /* set to 1 if a progress chunk fails to write */
+} stream_cb_state_t;
+
+/* Forward declaration: the stream callback uses send_response(). */
+static bool send_response(int fd, const char *id, bool ok,
+                          const char *result_json,
+                          int err_code, const char *err_msg);
+
+/* Called by ds3_engine_generate_ex after each token is selected in stream mode.
+ * We store the token, decode the full sequence so far, and emit a progress
+ * chunk {"text":"...","done":false}. If the write fails we mark the stream as
+ * failed and expire the generate deadline so the engine aborts quickly. */
+static void generate_stream_cb(int step, const float *logits, int n_vocab,
+                               int selected_token, void *user) {
+    (void)step;
+    (void)logits;
+    (void)n_vocab;
+
+    stream_cb_state_t *st = (stream_cb_state_t *)user;
+    if (!st || st->count >= st->capacity) return;
+    if (st->write_failed) return;
+    st->tokens[st->count++] = selected_token;
+
+    size_t text_cap = (size_t)st->count * 64 + 1;
+    char *text = (char *)malloc(text_cap);
+    if (!text) return;
+    int bytes = ds3_engine_decode_sequence(st->engine, st->tokens, st->count,
+                                           text, text_cap);
+    if (bytes < 0) bytes = 0;
+    text[bytes] = '\0';
+
+    buf_t result = {0};
+    buf_puts(&result, "{\"text\":\"");
+    json_escape_to_buf(&result, text);
+    buf_puts(&result, "\",\"done\":false}");
+    if (!send_response(st->fd, st->req_id, true, result.ptr, 0, NULL)) {
+        st->write_failed = 1;
+        /* Force the engine to abort on the next deadline check so we don't
+         * keep generating tokens the client will never receive. */
+        ds3_engine_set_generate_deadline(st->engine, 0.001);
+    }
+    buf_free(&result);
+    free(text);
+}
 
 static int generate_for_session(daemon_state_t *ds, session_t *s,
                                 const char *user_prompt, const char *context,
@@ -843,7 +1021,8 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
                                 char **out_text, int *out_prompt_tokens,
                                 int *out_gen_tokens,
                                 int *out_cached_prefix_len,
-                                int *out_new_cached_prefix_len) {
+                                int *out_new_cached_prefix_len,
+                                bool stream, int fd, const char *req_id) {
     buf_t prompt_buf = {0};
     build_chat_prompt(s, user_prompt, context, &prompt_buf);
 
@@ -888,14 +1067,28 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
         s->provider_session_created = 1;
     }
 
-    g_active_generate++;
+    stream_cb_state_t cb_state = {0};
+    if (stream) {
+        cb_state.engine = ds->engine;
+        cb_state.fd = fd;
+        cb_state.req_id = req_id;
+        cb_state.tokens = output_tokens;
+        cb_state.count = 0;
+        cb_state.capacity = max_gen;
+    }
+
     ds3_engine_set_generate_deadline(ds->engine, ds->generate_timeout);
     int n_gen = ds3_engine_generate_ex(ds->engine, prompt_tokens, n_prompt,
                                        max_gen, temp,
-                                       output_tokens, max_gen, NULL, NULL);
+                                       output_tokens, max_gen,
+                                       stream ? generate_stream_cb : NULL,
+                                       stream ? &cb_state : NULL);
     ds3_engine_clear_generate_deadline(ds->engine);
-    g_active_generate--;
     free(prompt_tokens);
+    if (stream && cb_state.write_failed) {
+        free(output_tokens);
+        return -4;
+    }
     if (n_gen == -2) {
         free(output_tokens);
         return -3;
@@ -927,8 +1120,8 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
     *out_cached_prefix_len = ds3_engine_last_cached_prefix_len(ds->engine);
     *out_new_cached_prefix_len = ds3_engine_last_new_cached_prefix_len(ds->engine);
     s->total_generated += n_gen;
-    ds->total_generated += n_gen;
-    ds->total_prompt_tokens += n_prompt;
+    atomic_add64(&ds->total_generated, n_gen);
+    atomic_add64(&ds->total_prompt_tokens, n_prompt);
     s->last_active = time(NULL);
     return 0;
 }
@@ -1017,7 +1210,9 @@ fail:
  * JSON response helpers
  * ============================================================================ */
 
-static void send_response(int fd, const char *id, bool ok,
+/* Send a JSON-RPC response line. Returns true if the entire line was written,
+ * false on write error (e.g. client closed the connection). */
+static bool send_response(int fd, const char *id, bool ok,
                           const char *result_json,
                           int err_code, const char *err_msg) {
     buf_t b = {0};
@@ -1037,15 +1232,18 @@ static void send_response(int fd, const char *id, bool ok,
     }
     buf_puts(&b, "}\n");
     size_t off = 0;
-    while (off < b.len) {
-        ssize_t n = write(fd, b.ptr + off, b.len - off);
+    size_t total = b.len;
+    while (off < total) {
+        ssize_t n = write(fd, b.ptr + off, total - off);
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
         }
+        if (n == 0) break;
         off += (size_t)n;
     }
     buf_free(&b);
+    return off == total;
 }
 
 static void send_error(int fd, const char *id, int code, const char *msg) {
@@ -1066,22 +1264,24 @@ static void handle_load_model(daemon_state_t *ds, const request_t *req, int fd) 
     params_get_int(req->params, "n_ctx", &n_ctx);
     if (n_ctx <= 0) n_ctx = ds->n_ctx;
 
+    pthread_mutex_lock(&ds->engine_mutex);
+    pthread_mutex_lock(&ds->sessions_mutex);
     if (ds->engine) {
         /* Close existing sessions; engine will be reopened. */
-        for (int i = 0; i < ds->n_sessions; i++) {
-            if (ds->kv_provider && ds->sessions[i]->provider_session_created) {
-                ds3_kv_cache_close_session(ds->kv_provider, ds->sessions[i]->id);
-            }
-            session_free(ds->sessions[i]);
+        while (ds->n_sessions > 0) {
+            session_t *s = ds->sessions[0];
+            pthread_mutex_lock(&s->mutex);
+            session_remove_at(ds, 0);
         }
-        ds->n_sessions = 0;
         ds3_engine_close(ds->engine);
         ds->engine = NULL;
     }
+    pthread_mutex_unlock(&ds->sessions_mutex);
 
     ds->engine = ds3_engine_open(path, n_ctx);
     free(path);
     if (!ds->engine) {
+        pthread_mutex_unlock(&ds->engine_mutex);
         send_error(fd, req->id, -32001, "failed to load model");
         return;
     }
@@ -1089,6 +1289,7 @@ static void handle_load_model(daemon_state_t *ds, const request_t *req, int fd) 
         ds3_engine_set_kv_provider(ds->engine, ds->kv_provider);
     }
     ds->n_ctx = n_ctx;
+    pthread_mutex_unlock(&ds->engine_mutex);
 
     buf_t b = {0};
     buf_printf(&b, "{\"loaded\":true,\"model_name\":\"%s\",\"n_ctx\":%d,\"vocab_size\":%d}",
@@ -1110,18 +1311,22 @@ static void handle_create_session(daemon_state_t *ds, const request_t *req, int 
     params_get_float(req->params, "temperature", &temperature);
     params_get_int(req->params, "max_tokens", &max_tokens);
 
-    session_t *s = session_create(ds, id, system_prompt, temperature, max_tokens);
+    int err_code = 0;
+    session_t *s = session_create(ds, id, system_prompt, temperature, max_tokens, &err_code);
     if (!s) {
         free(id);
         free(system_prompt);
-        send_error(fd, req->id, -32005, "failed to create session");
+        send_error(fd, req->id, err_code,
+                   err_code == ERR_SESSION_LIMIT ? "session limit reached" : "failed to create session");
         return;
     }
 
+    /* session_create returns with s->mutex held. */
     if (ds->kv_provider) {
         ds3_kv_cache_create_session(ds->kv_provider, id);
         s->provider_session_created = 1;
     }
+    pthread_mutex_unlock(&s->mutex);
 
     buf_t b = {0};
     buf_puts(&b, "{\"session_id\":\"");
@@ -1141,10 +1346,6 @@ static void handle_create_session(daemon_state_t *ds, const request_t *req, int 
 }
 
 static void handle_generate(daemon_state_t *ds, const request_t *req, int fd) {
-    if (!ds->engine) {
-        send_error(fd, req->id, -32001, "model not loaded");
-        return;
-    }
     char *session_id = NULL;
     char *user_prompt = NULL;
     char *context = NULL;
@@ -1152,8 +1353,19 @@ static void handle_generate(daemon_state_t *ds, const request_t *req, int fd) {
         send_error(fd, req->id, -32602, "missing session_id");
         return;
     }
-    session_t *s = session_find(ds, session_id);
+
+    /* Engine mutex first, then session lookup, to maintain a consistent
+     * lock ordering with handle_load_model. */
+    pthread_mutex_lock(&ds->engine_mutex);
+    if (!ds->engine) {
+        pthread_mutex_unlock(&ds->engine_mutex);
+        free(session_id);
+        send_error(fd, req->id, -32001, "model not loaded");
+        return;
+    }
+    session_t *s = session_find_and_lock(ds, session_id);
     if (!s) {
+        pthread_mutex_unlock(&ds->engine_mutex);
         free(session_id);
         send_error(fd, req->id, -32002, "session not found");
         return;
@@ -1164,6 +1376,8 @@ static void handle_generate(daemon_state_t *ds, const request_t *req, int fd) {
     int req_max = 0;
     params_get_float(req->params, "temperature", &req_temp);
     params_get_int(req->params, "max_tokens", &req_max);
+    bool stream = false;
+    params_get_bool(req->params, "stream", &stream, false);
 
     bool has_user = user_prompt && user_prompt[0];
 
@@ -1172,9 +1386,12 @@ static void handle_generate(daemon_state_t *ds, const request_t *req, int fd) {
     int cached_prefix_len = 0, new_cached_prefix_len = 0;
     int rc = generate_for_session(ds, s, has_user ? user_prompt : "", context,
                                   req_temp, req_max, &text, &n_prompt, &n_gen,
-                                  &cached_prefix_len, &new_cached_prefix_len);
+                                  &cached_prefix_len, &new_cached_prefix_len,
+                                  stream, fd, req->id);
+    pthread_mutex_unlock(&ds->engine_mutex);
     free(context);
     if (rc == -2) {
+        pthread_mutex_unlock(&s->mutex);
         free(session_id);
         free(user_prompt);
         free(text);
@@ -1182,43 +1399,67 @@ static void handle_generate(daemon_state_t *ds, const request_t *req, int fd) {
         return;
     }
     if (rc == -3) {
+        pthread_mutex_unlock(&s->mutex);
         free(session_id);
         free(user_prompt);
         free(text);
         send_error(fd, req->id, ERR_GENERATION_TIMEOUT, "generation timeout");
         return;
     }
-    if (rc != 0) {
+    if (rc == -4) {
+        pthread_mutex_unlock(&s->mutex);
         free(session_id);
         free(user_prompt);
         free(text);
-        send_error(fd, req->id, -32005, "generation failed");
+        send_error(fd, req->id, ERR_STREAM_WRITE_FAILED, "stream write failed");
+        return;
+    }
+    if (rc != 0) {
+        pthread_mutex_unlock(&s->mutex);
+        free(session_id);
+        free(user_prompt);
+        free(text);
+        send_error(fd, req->id, ERR_INTERNAL, "generation failed");
         return;
     }
 
-    /* Append user and assistant turns only after successful generation. */
+    int current_tokens = n_prompt + n_gen;
+    char *tool_calls_json = extract_tool_calls_json(text);
+    buf_t b = {0};
+    if (stream) {
+        buf_puts(&b, "{\"session_id\":\"");
+        json_escape_to_buf(&b, session_id);
+        buf_puts(&b, "\",\"text\":\"");
+        json_escape_to_buf(&b, text);
+        buf_printf(&b, "\",\"tokens_generated\":%d,\"tokens_prompt\":%d,\"current_tokens\":%d,\"max_tokens\":%d,\"n_ctx\":%d,\"cached_prefix_len\":%d,\"new_cached_prefix_len\":%d,\"tool_calls\":",
+                   n_gen, n_prompt, current_tokens, s->max_tokens, s->n_ctx,
+                   cached_prefix_len, new_cached_prefix_len);
+        buf_puts(&b, tool_calls_json ? tool_calls_json : "[]");
+        buf_puts(&b, ",\"done\":true}");
+    } else {
+        buf_puts(&b, "{\"session_id\":\"");
+        json_escape_to_buf(&b, session_id);
+        buf_puts(&b, "\",\"text\":\"");
+        json_escape_to_buf(&b, text);
+        buf_printf(&b, "\",\"tokens_generated\":%d,\"tokens_prompt\":%d,\"current_tokens\":%d,\"max_tokens\":%d,\"n_ctx\":%d,\"cached_prefix_len\":%d,\"new_cached_prefix_len\":%d,\"tool_calls\":",
+                   n_gen, n_prompt, current_tokens, s->max_tokens, s->n_ctx,
+                   cached_prefix_len, new_cached_prefix_len);
+        buf_puts(&b, tool_calls_json ? tool_calls_json : "[]");
+        buf_puts(&b, "}");
+    }
+    send_response(fd, req->id, true, b.ptr, 0, NULL);
+    buf_free(&b);
+    free(tool_calls_json);
+
+    /* Append user and assistant turns after the final response has been sent. */
     if (has_user) {
         session_append_message(s, "user", user_prompt, NULL, NULL, NULL);
     }
     free(user_prompt);
     session_append_message(s, "assistant", text, NULL, NULL, NULL);
-
-    int current_tokens = n_prompt + n_gen;
-    char *tool_calls_json = extract_tool_calls_json(text);
-    buf_t b = {0};
-    buf_puts(&b, "{\"session_id\":\"");
-    json_escape_to_buf(&b, session_id);
-    buf_puts(&b, "\",\"text\":\"");
-    json_escape_to_buf(&b, text);
-    buf_printf(&b, "\",\"tokens_generated\":%d,\"tokens_prompt\":%d,\"current_tokens\":%d,\"max_tokens\":%d,\"n_ctx\":%d,\"cached_prefix_len\":%d,\"new_cached_prefix_len\":%d,\"tool_calls\":",
-               n_gen, n_prompt, current_tokens, s->max_tokens, s->n_ctx,
-               cached_prefix_len, new_cached_prefix_len);
-    buf_puts(&b, tool_calls_json ? tool_calls_json : "[]");
-    buf_puts(&b, "}");
-    send_response(fd, req->id, true, b.ptr, 0, NULL);
-    buf_free(&b);
-    free(tool_calls_json);
     free(text);
+
+    pthread_mutex_unlock(&s->mutex);
     free(session_id);
 }
 
@@ -1232,13 +1473,14 @@ static void handle_append_turn(daemon_state_t *ds, const request_t *req, int fd)
         send_error(fd, req->id, -32602, "missing session_id");
         return;
     }
-    session_t *s = session_find(ds, session_id);
+    session_t *s = session_find_and_lock(ds, session_id);
     if (!s) {
         free(session_id);
         send_error(fd, req->id, -32002, "session not found");
         return;
     }
     if (!params_get_string(req->params, "role", &role) || !role || !role[0]) {
+        pthread_mutex_unlock(&s->mutex);
         free(session_id);
         send_error(fd, req->id, -32602, "missing role");
         return;
@@ -1249,6 +1491,7 @@ static void handle_append_turn(daemon_state_t *ds, const request_t *req, int fd)
 
     session_append_message(s, role, content ? content : "", NULL, tool_call_id, tool_name);
 
+    pthread_mutex_unlock(&s->mutex);
     free(session_id);
     free(role);
     free(content);
@@ -1265,7 +1508,7 @@ static void handle_replace_history(daemon_state_t *ds, const request_t *req, int
         send_error(fd, req->id, -32602, "missing session_id");
         return;
     }
-    session_t *s = session_find(ds, session_id);
+    session_t *s = session_find_and_lock(ds, session_id);
     if (!s) {
         free(session_id);
         send_error(fd, req->id, -32002, "session not found");
@@ -1302,6 +1545,7 @@ static void handle_replace_history(daemon_state_t *ds, const request_t *req, int
     }
 
     if (!messages_json) {
+        pthread_mutex_unlock(&s->mutex);
         free(session_id);
         send_error(fd, req->id, -32602, "missing messages");
         return;
@@ -1311,6 +1555,7 @@ static void handle_replace_history(daemon_state_t *ds, const request_t *req, int
     int n_msgs = 0;
     if (!parse_message_array(messages_json, &msgs, &n_msgs)) {
         free(messages_json);
+        pthread_mutex_unlock(&s->mutex);
         free(session_id);
         send_error(fd, req->id, -32602, "invalid messages");
         return;
@@ -1331,6 +1576,7 @@ static void handle_replace_history(daemon_state_t *ds, const request_t *req, int
         ds3_kv_cache_reset_session(ds->kv_provider, session_id);
     }
 
+    pthread_mutex_unlock(&s->mutex);
     free(session_id);
     send_response(fd, req->id, true, "{\"replaced\":true}", 0, NULL);
 }
@@ -1341,7 +1587,7 @@ static void handle_reset_session(daemon_state_t *ds, const request_t *req, int f
         send_error(fd, req->id, -32602, "missing session_id");
         return;
     }
-    session_t *s = session_find(ds, session_id);
+    session_t *s = session_find_and_lock(ds, session_id);
     if (!s) {
         free(session_id);
         send_error(fd, req->id, -32002, "session not found");
@@ -1352,6 +1598,7 @@ static void handle_reset_session(daemon_state_t *ds, const request_t *req, int f
     if (ds->kv_provider && s->provider_session_created) {
         ds3_kv_cache_reset_session(ds->kv_provider, session_id);
     }
+    pthread_mutex_unlock(&s->mutex);
     free(session_id);
     send_response(fd, req->id, true, "{\"reset\":true}", 0, NULL);
 }
@@ -1368,15 +1615,31 @@ static void handle_close_session(daemon_state_t *ds, const request_t *req, int f
 }
 
 static void handle_health(daemon_state_t *ds, const request_t *req, int fd) {
+    pthread_mutex_lock(&ds->sessions_mutex);
+    int n_sessions = ds->n_sessions;
+    pthread_mutex_unlock(&ds->sessions_mutex);
+    pthread_mutex_lock(&ds->engine_mutex);
+    bool model_loaded = ds->engine != NULL;
+    pthread_mutex_unlock(&ds->engine_mutex);
+    int64_t total_generated = atomic_load64(&ds->total_generated);
     buf_t b = {0};
-    buf_printf(&b, "{\"status\":\"ok\",\"model_loaded\":%s,\"active_sessions\":%d,\"total_tokens_generated\":%d,\"uptime_seconds\":%ld}",
-               ds->engine ? "true" : "false", ds->n_sessions, ds->total_generated,
+    buf_printf(&b, "{\"status\":\"ok\",\"model_loaded\":%s,\"active_sessions\":%d,\"total_tokens_generated\":%lld,\"uptime_seconds\":%ld}",
+               model_loaded ? "true" : "false", n_sessions, total_generated,
                (long)(time(NULL) - ds->started_at));
     send_response(fd, req->id, true, b.ptr, 0, NULL);
     buf_free(&b);
 }
 
 static void handle_stats(daemon_state_t *ds, const request_t *req, int fd) {
+    pthread_mutex_lock(&ds->sessions_mutex);
+    int n_sessions = ds->n_sessions;
+    pthread_mutex_unlock(&ds->sessions_mutex);
+    pthread_mutex_lock(&ds->engine_mutex);
+    bool model_loaded = ds->engine != NULL;
+    int n_ctx = ds->n_ctx;
+    pthread_mutex_unlock(&ds->engine_mutex);
+    int64_t total_generated = atomic_load64(&ds->total_generated);
+    int64_t total_prompt_tokens = atomic_load64(&ds->total_prompt_tokens);
     buf_t b = {0};
     buf_printf(&b, "{"
                "\"status\":\"ok\","
@@ -1384,20 +1647,20 @@ static void handle_stats(daemon_state_t *ds, const request_t *req, int fd) {
                "\"model_loaded\":%s,"
                "\"n_ctx\":%d,"
                "\"vocab_size\":%d,"
-               "\"gpu_layers\":%d,"
+               "\"n_layer\":%d,"
                "\"active_sessions\":%d,"
-               "\"total_tokens_generated\":%d,"
-               "\"total_tokens_prompt\":%d,"
+               "\"total_tokens_generated\":%lld,"
+               "\"total_tokens_prompt\":%lld,"
                "\"uptime_seconds\":%ld"
                "}",
                DS3_MODEL_NAME,
-               ds->engine ? "true" : "false",
-               ds->n_ctx,
+               model_loaded ? "true" : "false",
+               n_ctx,
                DS3_N_VOCAB,
                DS3_N_LAYER,
-               ds->n_sessions,
-               ds->total_generated,
-               ds->total_prompt_tokens,
+               n_sessions,
+               total_generated,
+               total_prompt_tokens,
                (long)(time(NULL) - ds->started_at));
     send_response(fd, req->id, true, b.ptr, 0, NULL);
     buf_free(&b);
@@ -1478,15 +1741,39 @@ static int read_line(int fd, buf_t *b, size_t max_size) {
     }
 }
 
-static void handle_connection(daemon_state_t *ds, int fd, double idle_timeout, double request_timeout) {
-    /* read_sec = request_timeout (per-request read), write_sec = idle_timeout (slow writer tolerance) */
-    set_socket_timeouts(fd, request_timeout, idle_timeout);
-    g_active_connections++;
+static void handle_connection(daemon_state_t *ds, int fd, int conn_idle_timeout,
+                              double request_timeout, double send_timeout) {
+    /* read_sec = request_timeout (per-request read), write_sec = send_timeout. */
+    set_socket_timeouts(fd, request_timeout, send_timeout);
     buf_t line = {0};
+    time_t idle_deadline = (conn_idle_timeout > 0) ? (time(NULL) + conn_idle_timeout) : 0;
     for (;;) {
         if (g_stop) break;
+        if (conn_idle_timeout > 0) {
+            time_t now = time(NULL);
+            if (now >= idle_deadline) break;
+            int remaining = (int)(idle_deadline - now);
+            /* Poll in 1-second chunks so we honour shutdown promptly while
+             * still enforcing the full connection idle timeout. */
+            int poll_ms = remaining > 1 ? 1000 : remaining * 1000;
+            struct pollfd pfd = { .fd = fd, .events = POLLIN };
+            int prc = poll(&pfd, 1, poll_ms);
+            if (prc < 0) {
+                if (errno == EINTR) {
+                    if (g_stop) break;
+                    continue;
+                }
+                break;
+            }
+            if (prc == 0) {
+                continue;
+            }
+        }
         int rc = read_line(fd, &line, ds->max_request_size);
         if (rc == 0) break;
+        if (conn_idle_timeout > 0 && rc > 0) {
+            idle_deadline = time(NULL) + conn_idle_timeout;
+        }
         if (rc < 0) {
             if (rc == -2) {
                 send_error(fd, NULL, ERR_REQUEST_TOO_LARGE, "request too large");
@@ -1517,7 +1804,87 @@ static void handle_connection(daemon_state_t *ds, int fd, double idle_timeout, d
         line.ptr = NULL;
     }
     buf_free(&line);
-    g_active_connections--;
+}
+
+static void *worker_thread(void *arg) {
+    daemon_state_t *ds = (daemon_state_t *)arg;
+    for (;;) {
+        pthread_mutex_lock(&ds->work_mutex);
+        while (!ds->shutdown && ds->work_head == NULL) {
+            pthread_cond_wait(&ds->work_cond, &ds->work_mutex);
+        }
+        if (ds->shutdown && ds->work_head == NULL) {
+            pthread_mutex_unlock(&ds->work_mutex);
+            break;
+        }
+        work_item_t *item = ds->work_head;
+        ds->work_head = item->next;
+        if (!ds->work_head) ds->work_tail = NULL;
+        ds->work_count--;
+        pthread_mutex_unlock(&ds->work_mutex);
+
+        handle_connection(ds, item->fd, ds->conn_idle_timeout,
+                          ds->request_timeout, ds->send_timeout);
+        close(item->fd);
+        free(item);
+    }
+    return NULL;
+}
+
+static void enqueue_work(daemon_state_t *ds, int fd) {
+    pthread_mutex_lock(&ds->work_mutex);
+    if (ds->max_work_queue > 0 && ds->work_count >= ds->max_work_queue) {
+        pthread_mutex_unlock(&ds->work_mutex);
+        fprintf(stderr, "enqueue_work: work queue full (%d), dropping connection\n",
+                ds->max_work_queue);
+        close(fd);
+        return;
+    }
+    pthread_mutex_unlock(&ds->work_mutex);
+
+    work_item_t *item = (work_item_t *)malloc(sizeof(*item));
+    if (!item) {
+        fprintf(stderr, "enqueue_work: out of memory, dropping connection\n");
+        close(fd);
+        return;
+    }
+    item->fd = fd;
+    item->next = NULL;
+    pthread_mutex_lock(&ds->work_mutex);
+    if (ds->work_tail) {
+        ds->work_tail->next = item;
+    } else {
+        ds->work_head = item;
+    }
+    ds->work_tail = item;
+    ds->work_count++;
+    pthread_cond_signal(&ds->work_cond);
+    pthread_mutex_unlock(&ds->work_mutex);
+}
+
+static void *reaper_thread(void *arg) {
+    daemon_state_t *ds = (daemon_state_t *)arg;
+    while (!ds->shutdown) {
+        sleep(5);
+        if (ds->shutdown) break;
+        if (ds->session_timeout <= 0) continue;
+
+        pthread_mutex_lock(&ds->sessions_mutex);
+        time_t now = time(NULL);
+        for (int i = 0; i < ds->n_sessions; ) {
+            session_t *s = ds->sessions[i];
+            if (pthread_mutex_trylock(&s->mutex) == 0) {
+                if ((int)(now - s->last_active) > ds->session_timeout) {
+                    session_remove_at(ds, i);
+                    continue;
+                }
+                pthread_mutex_unlock(&s->mutex);
+            }
+            i++;
+        }
+        pthread_mutex_unlock(&ds->sessions_mutex);
+    }
+    return NULL;
 }
 
 static int create_unix_socket(const char *path) {
@@ -1561,6 +1928,12 @@ static void print_usage(const char *argv0) {
         "  -t SEC    Single generate timeout (default: 600)\n"
         "  -T SEC    Connection idle timeout (default: 300)\n"
         "  -R SEC    Per-request read timeout (default: 60)\n"
+        "  -w SEC    Socket send/write timeout (default: 300)\n"
+        "  -I SEC    Alias for -T (connection idle timeout)\n"
+        "  -W N      Worker thread pool size (default: 4)\n"
+        "  -Q N      Maximum queued connections, 0 = unlimited (default: 1024)\n"
+        "  -M N      Maximum concurrent sessions, 0 = unlimited (default: 0)\n"
+        "  -S SEC    Session idle timeout, 0 = disabled (default: 0)\n"
         "  -k TYPE   KV-cache provider: local, service, fallback, none (default: none)\n"
         "  -K PATH   KV-cache service socket path (default: /tmp/ds3-kv-cache.sock)\n"
         "  -i ID     Daemon ID reported to the KV-cache service (default: pid)\n"
@@ -1581,8 +1954,13 @@ int main(int argc, char **argv) {
     int n_ctx = 4096;
     size_t max_request_size = 1024 * 1024;
     double generate_timeout = 600.0;
-    double idle_timeout = 300.0;
+    double send_timeout = 300.0;
     double request_timeout = 60.0;
+    int conn_idle_timeout = 300;
+    int workers = 4;
+    int max_queued = 1024;
+    int max_sessions = 0;
+    int session_timeout = 0;
     bool quiet = false;
 
     for (int i = 1; i < argc; i++) {
@@ -1598,12 +1976,44 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             generate_timeout = atof(argv[++i]);
             if (generate_timeout <= 0) generate_timeout = 600.0;
-        } else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {
-            idle_timeout = atof(argv[++i]);
-            if (idle_timeout <= 0) idle_timeout = 300.0;
+        } else if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--conn-idle-timeout") == 0) {
+            if (i + 1 < argc) {
+                conn_idle_timeout = atoi(argv[++i]);
+                if (conn_idle_timeout <= 0) conn_idle_timeout = 300;
+            }
         } else if (strcmp(argv[i], "-R") == 0 && i + 1 < argc) {
             request_timeout = atof(argv[++i]);
             if (request_timeout <= 0) request_timeout = 60.0;
+        } else if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--send-timeout") == 0) {
+            if (i + 1 < argc) {
+                send_timeout = atof(argv[++i]);
+                if (send_timeout <= 0) send_timeout = 300.0;
+            }
+        } else if (strcmp(argv[i], "-I") == 0) {
+            if (i + 1 < argc) {
+                conn_idle_timeout = atoi(argv[++i]);
+                if (conn_idle_timeout <= 0) conn_idle_timeout = 300;
+            }
+        } else if (strcmp(argv[i], "-W") == 0 || strcmp(argv[i], "--workers") == 0) {
+            if (i + 1 < argc) {
+                workers = atoi(argv[++i]);
+                if (workers <= 0) workers = 4;
+            }
+        } else if (strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--max-queued-connections") == 0) {
+            if (i + 1 < argc) {
+                max_queued = atoi(argv[++i]);
+                if (max_queued < 0) max_queued = 1024;
+            }
+        } else if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--max-sessions") == 0) {
+            if (i + 1 < argc) {
+                max_sessions = atoi(argv[++i]);
+                if (max_sessions < 0) max_sessions = 0;
+            }
+        } else if (strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--session-timeout") == 0) {
+            if (i + 1 < argc) {
+                session_timeout = atoi(argv[++i]);
+                if (session_timeout < 0) session_timeout = 0;
+            }
         } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
             kv_provider_type = argv[++i];
         } else if (strcmp(argv[i], "-K") == 0 && i + 1 < argc) {
@@ -1633,7 +2043,19 @@ int main(int argc, char **argv) {
     ds.n_ctx = n_ctx;
     ds.max_request_size = max_request_size;
     ds.generate_timeout = generate_timeout;
+    ds.send_timeout = send_timeout;
+    ds.request_timeout = request_timeout;
+    ds.conn_idle_timeout = conn_idle_timeout;
+    ds.n_workers = workers;
+    ds.max_work_queue = max_queued;
+    ds.max_sessions = max_sessions;
+    ds.session_timeout = session_timeout;
     ds.started_at = time(NULL);
+
+    pthread_mutex_init(&ds.engine_mutex, NULL);
+    pthread_mutex_init(&ds.sessions_mutex, NULL);
+    pthread_mutex_init(&ds.work_mutex, NULL);
+    pthread_cond_init(&ds.work_cond, NULL);
 
     if (strcmp(kv_provider_type, "local") == 0) {
         ds.kv_provider = ds3_kv_cache_provider_open(&ds3_kv_local_provider, NULL);
@@ -1663,16 +2085,52 @@ int main(int argc, char **argv) {
         ds3_engine_set_kv_provider(ds.engine, ds.kv_provider);
     }
 
+    ds.workers = (pthread_t *)malloc((size_t)workers * sizeof(pthread_t));
+    if (!ds.workers) {
+        fprintf(stderr, "out of memory\n");
+        ds3_engine_close(ds.engine);
+        ds3_kv_cache_provider_close(ds.kv_provider);
+        return 1;
+    }
+    for (int i = 0; i < workers; i++) {
+        if (pthread_create(&ds.workers[i], NULL, worker_thread, &ds) != 0) {
+            fprintf(stderr, "failed to create worker thread\n");
+            ds.shutdown = 1;
+            pthread_cond_broadcast(&ds.work_cond);
+            for (int j = 0; j < i; j++) pthread_join(ds.workers[j], NULL);
+            free(ds.workers);
+            ds3_engine_close(ds.engine);
+            ds3_kv_cache_provider_close(ds.kv_provider);
+            return 1;
+        }
+    }
+    if (pthread_create(&ds.reaper_thread, NULL, reaper_thread, &ds) != 0) {
+        fprintf(stderr, "failed to create reaper thread\n");
+        ds.shutdown = 1;
+        pthread_cond_broadcast(&ds.work_cond);
+        for (int j = 0; j < workers; j++) pthread_join(ds.workers[j], NULL);
+        free(ds.workers);
+        ds3_engine_close(ds.engine);
+        ds3_kv_cache_provider_close(ds.kv_provider);
+        return 1;
+    }
+
     int listen_fd = create_unix_socket(socket_path);
     if (listen_fd < 0) {
         fprintf(stderr, "Failed to bind socket %s: %s\n", socket_path, strerror(errno));
+        ds.shutdown = 1;
+        pthread_cond_broadcast(&ds.work_cond);
+        for (int j = 0; j < workers; j++) pthread_join(ds.workers[j], NULL);
+        pthread_join(ds.reaper_thread, NULL);
+        free(ds.workers);
         ds3_engine_close(ds.engine);
+        ds3_kv_cache_provider_close(ds.kv_provider);
         return 1;
     }
 
     if (!quiet) {
         ds3_print_model_info(ds.engine);
-        fprintf(stderr, "Listening on %s\n", socket_path);
+        fprintf(stderr, "Listening on %s with %d workers\n", socket_path, workers);
     }
 
     signal(SIGINT, signal_handler);
@@ -1696,35 +2154,40 @@ int main(int argc, char **argv) {
             fprintf(stderr, "accept failed: %s\n", strerror(errno));
             break;
         }
-        handle_connection(&ds, fd, idle_timeout, request_timeout);
-        close(fd);
+        enqueue_work(&ds, fd);
     }
 
-    /* Graceful shutdown: stop accepting new connections and wait for in-flight
-     * work to finish (up to the generate timeout, then force cleanup). */
+    /* Graceful shutdown: stop accepting new connections, wake workers, and
+     * wait for in-flight work to finish. */
     close(listen_fd);
     unlink(socket_path);
+    ds.shutdown = 1;
+    pthread_cond_broadcast(&ds.work_cond);
 
     if (!quiet) {
-        fprintf(stderr, "Shutting down, waiting for active connections/generations...\n");
+        fprintf(stderr, "Shutting down, waiting for workers...\n");
     }
-    time_t shutdown_deadline = time(NULL) + (time_t)(generate_timeout > 0 ? generate_timeout : 60.0) + 5;
-    while ((g_active_connections > 0 || g_active_generate > 0) && time(NULL) < shutdown_deadline) {
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
+    for (int i = 0; i < workers; i++) {
+        pthread_join(ds.workers[i], NULL);
     }
-    if (!quiet && (g_active_connections > 0 || g_active_generate > 0)) {
-        fprintf(stderr, "Warning: forced shutdown with %d active connection(s) and %d active generation(s)\n",
-                (int)g_active_connections, (int)g_active_generate);
-    }
+    pthread_join(ds.reaper_thread, NULL);
+    free(ds.workers);
+
+    /* Drain any remaining sessions. */
     for (int i = 0; i < ds.n_sessions; i++) {
         if (ds.kv_provider && ds.sessions[i]->provider_session_created) {
             ds3_kv_cache_close_session(ds.kv_provider, ds.sessions[i]->id);
         }
-        session_free(ds.sessions[i]);
+        session_destroy(ds.sessions[i]);
     }
     free(ds.sessions);
     ds3_engine_close(ds.engine);
     ds3_kv_cache_provider_close(ds.kv_provider);
+
+    pthread_mutex_destroy(&ds.engine_mutex);
+    pthread_mutex_destroy(&ds.sessions_mutex);
+    pthread_mutex_destroy(&ds.work_mutex);
+    pthread_cond_destroy(&ds.work_cond);
+
     return 0;
 }

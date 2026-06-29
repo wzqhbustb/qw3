@@ -3391,3 +3391,8 @@ int ds3_engine_decode_sequence(const ds3_engine_t *e,
     if (!e || !tokens || n_tokens <= 0 || !buf || buf_size == 0) return -1;
     return ds3_vocab_decode_sequence(&e->vocab, tokens, n_tokens, buf, buf_size);
 }
+
+int ds3_engine_vocab_size(const ds3_engine_t *e)
+{
+    return e ? e->vocab.n_vocab : 0;
+}

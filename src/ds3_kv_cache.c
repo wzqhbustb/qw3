@@ -499,6 +499,11 @@ static int service_connect(ds3_kv_service_state_t *svc)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#endif
+
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -522,6 +527,9 @@ static void service_disconnect(ds3_kv_service_state_t *svc)
         svc->fd = -1;
     }
     svc->connected = 0;
+    /* Force a fresh GetConfig on the next RPC so a reconnected daemon
+     * re-registers its daemon_id with the new service process. */
+    svc->own_arena_idx = -1;
 }
 
 /* Send a full protobuf message with length prefix. */
@@ -728,8 +736,6 @@ static int service_call_inner(ds3_kv_service_state_t *svc,
                               const pb_msgdesc_t *req_fields, const void *req_msg,
                               const pb_msgdesc_t *resp_fields, void *resp_msg)
 {
-    if (service_connect(svc) != 0) return -1;
-
     size_t payload_cap = 4096;
     uint8_t *payload = (uint8_t *)malloc(payload_cap);
     if (!payload) return -1;
@@ -782,24 +788,34 @@ static int service_call_inner(ds3_kv_service_state_t *svc,
     free(payload);
     free(payload_bytes);
 
-    if (service_send(svc->fd, enc, estream.bytes_written) != 0) {
-        service_disconnect(svc);
-        free(enc);
-        return -1;
-    }
-    free(enc);
-
+    int rc = -1;
     uint8_t *resp_data = NULL;
     size_t resp_len = 0;
-    if (service_recv(svc->fd, &resp_data, &resp_len) != 0) {
-        service_disconnect(svc);
-        return -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (service_connect(svc) != 0) {
+            rc = -1;
+            break;
+        }
+        if (service_send(svc->fd, enc, estream.bytes_written) != 0) {
+            service_disconnect(svc);
+            rc = -1;
+            continue;
+        }
+        resp_data = NULL;
+        resp_len = 0;
+        if (service_recv(svc->fd, &resp_data, &resp_len) != 0) {
+            service_disconnect(svc);
+            rc = -1;
+            continue;
+        }
+        pb_istream_t istream = pb_istream_from_buffer(resp_data, resp_len);
+        bool ok = pb_decode(&istream, resp_fields, resp_msg);
+        free(resp_data);
+        rc = ok ? 0 : -1;
+        break;
     }
-
-    pb_istream_t istream = pb_istream_from_buffer(resp_data, resp_len);
-    bool ok = pb_decode(&istream, resp_fields, resp_msg);
-    free(resp_data);
-    return ok ? 0 : -1;
+    free(enc);
+    return rc;
 }
 
 /* Send a Heartbeat RPC to the service, listing all active sessions.
@@ -1376,6 +1392,21 @@ static int service_lookup(ds3_kv_cache_provider_t *p,
         }
         pos += sc->blocks[i].n_tokens;
     }
+
+    /* Only use complete blocks that fit inside the current prompt.  A block
+     * that would extend past the end of the prompt cannot be read atomically
+     * and would make the next Store RPC report a non-block-boundary prefix. */
+    int usable_cached_len = 0;
+    int included_blocks = 0;
+    for (int i = 0; i < sc->n_blocks; i++) {
+        if (usable_cached_len + sc->blocks[i].n_tokens > n_tokens) {
+            break;
+        }
+        usable_cached_len += sc->blocks[i].n_tokens;
+        included_blocks++;
+    }
+    sc->cached_len = usable_cached_len;
+    sc->n_blocks = included_blocks;
 
     *out_cached_len = sc->cached_len;
     return 0;

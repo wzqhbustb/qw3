@@ -389,6 +389,7 @@ typedef struct {
     int conn_idle_timeout;
     int max_sessions;
     int session_timeout;
+    int gpu_layers;
 } daemon_state_t;
 
 /* ============================================================================
@@ -638,16 +639,19 @@ static session_t *session_create(daemon_state_t *ds, const char *id,
                                  int *err_code) {
     pthread_mutex_lock(&ds->sessions_mutex);
 
-    /* Enforce max-sessions limit by evicting the oldest idle session. */
+    /* Enforce max-sessions limit by evicting the oldest idle session.
+     * We keep the current oldest candidate locked while scanning so its
+     * last_active cannot race with another request touching the session. */
     if (ds->max_sessions > 0 && ds->n_sessions >= ds->max_sessions) {
         int oldest_idx = -1;
         time_t oldest = 0;
         for (int i = 0; i < ds->n_sessions; i++) {
-            if (pthread_mutex_trylock(&ds->sessions[i]->mutex) == 0) {
-                if (oldest_idx == -1 || ds->sessions[i]->last_active < oldest) {
-                    oldest_idx = i;
-                    oldest = ds->sessions[i]->last_active;
-                }
+            if (pthread_mutex_trylock(&ds->sessions[i]->mutex) != 0) continue;
+            if (oldest_idx == -1 || ds->sessions[i]->last_active < oldest) {
+                if (oldest_idx >= 0) pthread_mutex_unlock(&ds->sessions[oldest_idx]->mutex);
+                oldest_idx = i;
+                oldest = ds->sessions[i]->last_active;
+            } else {
                 pthread_mutex_unlock(&ds->sessions[i]->mutex);
             }
         }
@@ -656,7 +660,6 @@ static session_t *session_create(daemon_state_t *ds, const char *id,
             *err_code = ERR_SESSION_LIMIT;
             return NULL;
         }
-        pthread_mutex_lock(&ds->sessions[oldest_idx]->mutex);
         session_remove_at(ds, oldest_idx);
     }
 
@@ -971,6 +974,9 @@ typedef struct {
     int count;
     int capacity;
     int write_failed;   /* set to 1 if a progress chunk fails to write */
+    char *text;         /* cumulative decoded text, grown incrementally */
+    size_t text_len;
+    size_t text_cap;
 } stream_cb_state_t;
 
 /* Forward declaration: the stream callback uses send_response(). */
@@ -993,17 +999,31 @@ static void generate_stream_cb(int step, const float *logits, int n_vocab,
     if (st->write_failed) return;
     st->tokens[st->count++] = selected_token;
 
-    size_t text_cap = (size_t)st->count * 64 + 1;
-    char *text = (char *)malloc(text_cap);
-    if (!text) return;
-    int bytes = ds3_engine_decode_sequence(st->engine, st->tokens, st->count,
-                                           text, text_cap);
+    /* Decode only the newest token and append it to the cumulative text.
+     * This avoids the O(n^2) full-sequence decode that grows with stream length. */
+    char piece[256];
+    int bytes = ds3_engine_decode_sequence(st->engine,
+                                           &st->tokens[st->count - 1], 1,
+                                           piece, sizeof(piece));
     if (bytes < 0) bytes = 0;
-    text[bytes] = '\0';
+    piece[bytes] = '\0';
+
+    size_t need = st->text_len + (size_t)bytes + 1;
+    if (need > st->text_cap) {
+        size_t new_cap = st->text_cap ? st->text_cap * 2 : 256;
+        while (new_cap < need) new_cap *= 2;
+        char *new_text = (char *)realloc(st->text, new_cap);
+        if (!new_text) return;
+        st->text = new_text;
+        st->text_cap = new_cap;
+    }
+    memcpy(st->text + st->text_len, piece, (size_t)bytes);
+    st->text_len += (size_t)bytes;
+    st->text[st->text_len] = '\0';
 
     buf_t result = {0};
     buf_puts(&result, "{\"text\":\"");
-    json_escape_to_buf(&result, text);
+    json_escape_to_buf(&result, st->text);
     buf_puts(&result, "\",\"done\":false}");
     if (!send_response(st->fd, st->req_id, true, result.ptr, 0, NULL)) {
         st->write_failed = 1;
@@ -1012,7 +1032,6 @@ static void generate_stream_cb(int step, const float *logits, int n_vocab,
         ds3_engine_set_generate_deadline(st->engine, 0.001);
     }
     buf_free(&result);
-    free(text);
 }
 
 static int generate_for_session(daemon_state_t *ds, session_t *s,
@@ -1084,6 +1103,7 @@ static int generate_for_session(daemon_state_t *ds, session_t *s,
                                        stream ? generate_stream_cb : NULL,
                                        stream ? &cb_state : NULL);
     ds3_engine_clear_generate_deadline(ds->engine);
+    if (stream) free(cb_state.text);
     free(prompt_tokens);
     if (stream && cb_state.write_failed) {
         free(output_tokens);
@@ -1291,9 +1311,10 @@ static void handle_load_model(daemon_state_t *ds, const request_t *req, int fd) 
     ds->n_ctx = n_ctx;
     pthread_mutex_unlock(&ds->engine_mutex);
 
+    int vocab_size = ds3_engine_vocab_size(ds->engine);
     buf_t b = {0};
-    buf_printf(&b, "{\"loaded\":true,\"model_name\":\"%s\",\"n_ctx\":%d,\"vocab_size\":%d}",
-               DS3_MODEL_NAME, n_ctx, DS3_N_VOCAB);
+    buf_printf(&b, "{\"loaded\":true,\"model_name\":\"%s\",\"n_ctx\":%d,\"vocab_size\":%d,\"gpu_layers\":%d}",
+               DS3_MODEL_NAME, n_ctx, vocab_size, ds->gpu_layers);
     send_response(fd, req->id, true, b.ptr, 0, NULL);
     buf_free(&b);
 }
@@ -1637,6 +1658,8 @@ static void handle_stats(daemon_state_t *ds, const request_t *req, int fd) {
     pthread_mutex_lock(&ds->engine_mutex);
     bool model_loaded = ds->engine != NULL;
     int n_ctx = ds->n_ctx;
+    int vocab_size = ds->engine ? ds3_engine_vocab_size(ds->engine) : 0;
+    int n_layer = ds->engine ? DS3_N_LAYER : 0;
     pthread_mutex_unlock(&ds->engine_mutex);
     int64_t total_generated = atomic_load64(&ds->total_generated);
     int64_t total_prompt_tokens = atomic_load64(&ds->total_prompt_tokens);
@@ -1648,6 +1671,7 @@ static void handle_stats(daemon_state_t *ds, const request_t *req, int fd) {
                "\"n_ctx\":%d,"
                "\"vocab_size\":%d,"
                "\"n_layer\":%d,"
+               "\"gpu_layers\":%d,"
                "\"active_sessions\":%d,"
                "\"total_tokens_generated\":%lld,"
                "\"total_tokens_prompt\":%lld,"
@@ -1656,8 +1680,9 @@ static void handle_stats(daemon_state_t *ds, const request_t *req, int fd) {
                DS3_MODEL_NAME,
                model_loaded ? "true" : "false",
                n_ctx,
-               DS3_N_VOCAB,
-               DS3_N_LAYER,
+               vocab_size,
+               n_layer,
+               ds->gpu_layers,
                n_sessions,
                total_generated,
                total_prompt_tokens,
@@ -1802,6 +1827,9 @@ static void handle_connection(daemon_state_t *ds, int fd, int conn_idle_timeout,
         request_free(&req);
         buf_free(&line);
         line.ptr = NULL;
+        if (conn_idle_timeout > 0) {
+            idle_deadline = time(NULL) + conn_idle_timeout;
+        }
     }
     buf_free(&line);
 }
@@ -1934,6 +1962,7 @@ static void print_usage(const char *argv0) {
         "  -Q N      Maximum queued connections, 0 = unlimited (default: 1024)\n"
         "  -M N      Maximum concurrent sessions, 0 = unlimited (default: 0)\n"
         "  -S SEC    Session idle timeout, 0 = disabled (default: 0)\n"
+        "  -g N      GPU layers to offload (default: all)\n"
         "  -k TYPE   KV-cache provider: local, service, fallback, none (default: none)\n"
         "  -K PATH   KV-cache service socket path (default: /tmp/ds3-kv-cache.sock)\n"
         "  -i ID     Daemon ID reported to the KV-cache service (default: pid)\n"
@@ -1961,6 +1990,7 @@ int main(int argc, char **argv) {
     int max_queued = 1024;
     int max_sessions = 0;
     int session_timeout = 0;
+    int gpu_layers = DS3_N_LAYER;
     bool quiet = false;
 
     for (int i = 1; i < argc; i++) {
@@ -2014,6 +2044,11 @@ int main(int argc, char **argv) {
                 session_timeout = atoi(argv[++i]);
                 if (session_timeout < 0) session_timeout = 0;
             }
+        } else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--gpu-layers") == 0) {
+            if (i + 1 < argc) {
+                gpu_layers = atoi(argv[++i]);
+                if (gpu_layers < 0) gpu_layers = DS3_N_LAYER;
+            }
         } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
             kv_provider_type = argv[++i];
         } else if (strcmp(argv[i], "-K") == 0 && i + 1 < argc) {
@@ -2050,6 +2085,7 @@ int main(int argc, char **argv) {
     ds.max_work_queue = max_queued;
     ds.max_sessions = max_sessions;
     ds.session_timeout = session_timeout;
+    ds.gpu_layers = gpu_layers;
     ds.started_at = time(NULL);
 
     pthread_mutex_init(&ds.engine_mutex, NULL);
@@ -2135,6 +2171,7 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 
     while (!g_stop) {
         struct pollfd pfd = { .fd = listen_fd, .events = POLLIN };

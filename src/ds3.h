@@ -393,6 +393,7 @@ int  ds3_engine_chat_format(const struct ds3_engine *engine,
 int  ds3_engine_decode_sequence(const struct ds3_engine *engine,
                                 const int *tokens, int n_tokens,
                                 char *buf, size_t buf_size);
+int  ds3_engine_vocab_size(const struct ds3_engine *engine);
 
 /* Diagnostics */
 void ds3_print_tensor_info(const ds3_tensor_t *t);

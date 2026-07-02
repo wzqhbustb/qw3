@@ -208,6 +208,61 @@ buffers. Instead:
 
 This saves several GB of allocations for `Qwen3-30B-A3B`.
 
+## KV Cache Service Integration
+
+The daemon can use the external Rust `ds3-kv-cache-svc` for cross-session / cross-daemon prefix caching instead of managing KV locally.
+
+Run the service in tiered mode:
+
+```bash
+/Users/wangyang/kv_cache/target/debug/ds3-kv-cache-svc \
+    --tiered \
+    -s /tmp/ds3-kv-cache.sock \
+    -p /tmp/ds3-kv-cache-dir \
+    -m 1073741824 \
+    --max-daemons 2 \
+    --heartbeat-timeout-secs 30
+```
+
+Run the daemon connected to the service:
+
+```bash
+./qwen3-engine-daemon \
+    -m /path/to/Qwen3-30B-A3B-Q4_K_M.gguf \
+    -s /tmp/qwen3-engine.sock \
+    -c 2048 \
+    -k service \
+    -K /tmp/ds3-kv-cache.sock \
+    -i daemon1
+```
+
+Key flags:
+
+- `-k service` — use the Rust KV Cache Service provider.
+- `-K <sock>` — Unix Domain Socket path of the Rust service.
+- `-i <daemon-id>` — unique daemon id; service uses this to isolate SHM arenas and heartbeat leases.
+- `--max-daemons` on the service side limits concurrent daemon arenas.
+- `--heartbeat-timeout-secs` controls how long the service waits before cleaning up a vanished daemon's sessions and migrating its Global blocks.
+
+When a second daemon (`-i daemon2`) looks up a prefix owned by `daemon1`, the Rust service returns `daemon1`'s SHM arena name; `daemon2` maps that arena read-only (`O_RDONLY` + `PROT_READ`) to access the shared KV.
+
+### Service-side integration tests
+
+```bash
+cd /Users/wangyang/kv_cache
+cargo test
+```
+
+### Daemon-side integration tests
+
+```bash
+cd /Users/wangyang/metal_demo
+python3 tests/run_kv_cache_service_test.py
+python3 tests/test_two_daemon_cross_read.py
+python3 tests/test_milestone3_acceptance.py
+python3 tests/test_performance_baseline.py   # longer benchmark run
+```
+
 ## Performance Notes
 
 - See [`docs/BENCHMARK.md`](../docs/BENCHMARK.md) for reproducible commands,

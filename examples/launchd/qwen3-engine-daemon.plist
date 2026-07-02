@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qwen3-engine.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/wangyang/metal_demo/qwen3-engine-daemon</string>
+        <!-- Replace /path/to/your/model.gguf with the actual model file path -->
+        <string>-m</string>
+        <string>/path/to/your/model.gguf</string>
+        <string>-s</string>
+        <string>/tmp/qwen3-engine.sock</string>
+        <!-- Optional context size: adjust as needed -->
+        <string>-c</string>
+        <string>4096</string>
+    </array>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/qwen3-engine-daemon.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/qwen3-engine-daemon.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

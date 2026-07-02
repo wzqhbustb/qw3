@@ -1,0 +1,20 @@
+[Unit]
+Description=Qwen3 Engine Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/Users/wangyang/metal_demo/qwen3-engine-daemon -m /path/to/your/model.gguf -s /tmp/qwen3-engine.sock -c 4096
+Restart=always
+RestartSec=5
+
+# Run as root. Change to a dedicated user if preferred.
+User=root
+
+# Optional: sandboxing (uncomment if desired)
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

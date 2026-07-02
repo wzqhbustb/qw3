@@ -97,6 +97,7 @@ int ds3_vocab_decode_sequence(const ds3_vocab_t *vocab,
  *   <|im_start|>system\n{SYSTEM}<|im_end|>\n<|im_start|>user\n{USER}<|im_end|>\n<|im_start|>assistant\n
  *
  * If system is NULL or empty, the system message is omitted.
+ * If system is NULL or empty, the system message is omitted.
  * The returned tokens include the assistant prefix, ready for model generation.
  * Returns number of tokens written (may be fewer than max_tokens). */
 int ds3_chat_format(const ds3_vocab_t *vocab,
